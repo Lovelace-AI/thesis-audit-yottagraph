@@ -98,6 +98,17 @@
                 {{ results.limitations }}
             </v-card-text>
         </v-card>
+
+        <div class="results-actions">
+            <v-btn variant="outlined" @click="$emit('edit')">
+                <v-icon start>mdi-pencil-outline</v-icon>
+                Edit Thesis
+            </v-btn>
+            <v-btn variant="outlined" @click="$emit('reset')">
+                <v-icon start>mdi-plus</v-icon>
+                Propose New Thesis
+            </v-btn>
+        </div>
     </div>
 </template>
 
@@ -106,6 +117,11 @@
 
     defineProps<{
         results: ThesisResults;
+    }>();
+
+    defineEmits<{
+        edit: [];
+        reset: [];
     }>();
 </script>
 
@@ -193,5 +209,14 @@
         font-size: 0.85rem;
         color: var(--lv-silver);
         line-height: 1.5;
+    }
+
+    .results-actions {
+        display: flex;
+        justify-content: center;
+        gap: 12px;
+        margin-top: 32px;
+        padding-top: 24px;
+        border-top: 1px solid rgba(128, 128, 128, 0.2);
     }
 </style>

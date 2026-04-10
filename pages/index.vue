@@ -42,7 +42,12 @@
             <div v-else-if="status === 'done'">
                 <ThesisBar :thesis="thesis" show-actions @edit="handleEdit" @reset="handleReset" />
                 <div class="content-area">
-                    <ResearchResults v-if="results" :results="results" />
+                    <ResearchResults
+                        v-if="results"
+                        :results="results"
+                        @edit="handleEdit"
+                        @reset="handleReset"
+                    />
                     <v-card v-else-if="rawFallback" variant="outlined" class="raw-fallback">
                         <v-card-title class="raw-title">Agent Response</v-card-title>
                         <v-card-text class="raw-text">{{ rawFallback }}</v-card-text>

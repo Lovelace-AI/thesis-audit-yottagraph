@@ -113,7 +113,7 @@
 
         <div class="clarification-actions">
             <v-btn color="primary" size="large" :disabled="!allResolved" @click="handleConfirm">
-                Looks Good, Research It
+                Research It
             </v-btn>
             <v-btn variant="text" @click="$emit('edit')"> Edit Thesis </v-btn>
         </div>
