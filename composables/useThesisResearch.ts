@@ -254,26 +254,35 @@ export function useThesisResearch() {
     // Parse structured JSON from agent response
     // -----------------------------------------------------------------------
 
+    function stripTrailingCommas(json: string): string {
+        return json.replace(/,\s*([\]}])/g, '$1');
+    }
+
+    function tryParseJSON(raw: string): any | null {
+        try {
+            return JSON.parse(raw);
+        } catch {
+            try {
+                return JSON.parse(stripTrailingCommas(raw));
+            } catch {
+                return null;
+            }
+        }
+    }
+
     function parseAgentResponse(text: string): ClarificationResponse | ThesisResults | null {
         const jsonMatch = text.match(/```json\s*([\s\S]*?)```/);
         const toParse = jsonMatch ? jsonMatch[1].trim() : text.trim();
-        try {
-            const parsed = JSON.parse(toParse);
-            if (parsed.type === 'clarification' || parsed.type === 'results') {
-                return parsed;
-            }
-        } catch {
-            // Not valid JSON
+
+        const parsed = tryParseJSON(toParse);
+        if (parsed?.type === 'clarification' || parsed?.type === 'results') {
+            return parsed;
         }
 
-        // Try to find any JSON object in the text
         const braceMatch = text.match(/\{[\s\S]*"type"\s*:\s*"(clarification|results)"[\s\S]*\}/);
         if (braceMatch) {
-            try {
-                return JSON.parse(braceMatch[0]);
-            } catch {
-                // Give up
-            }
+            const fallback = tryParseJSON(braceMatch[0]);
+            if (fallback) return fallback;
         }
         return null;
     }
