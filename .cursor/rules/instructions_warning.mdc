@@ -1,0 +1,41 @@
+---
+description: Warns users not to modify package-managed instruction files in .cursor/
+alwaysApply: false
+---
+
+# Aether Instructions Warning
+
+**You are editing a file managed by the `@yottagraph-app/aether-instructions` package.**
+
+Package-managed files are tracked by `.cursor/.aether-instructions-manifest`.
+They will be **overwritten** when you run `/update_instructions`.
+
+## Do Not
+
+- Modify files listed in the manifest directly (changes will be lost on update)
+
+## To Customize
+
+If you need to modify a package-provided rule or command:
+
+1. **Copy** the file to a new name
+2. Make your changes to the copy
+3. Remove the original's entry from `.cursor/.aether-instructions-manifest`
+   so it won't be replaced on update
+
+Example:
+
+```bash
+# Copy the rule you want to customize
+cp .cursor/rules/data.mdc .cursor/rules/data_custom.mdc
+
+# Edit your copy — it won't be affected by instruction updates
+```
+
+## How It Works
+
+- `.cursor/.aether-instructions-manifest` lists every file installed by the
+  package (one relative path per line, e.g. `rules/data.mdc`)
+- `/update_instructions` deletes manifest entries, extracts fresh files from
+  the latest package, and writes a new manifest
+- Files not in the manifest are never touched

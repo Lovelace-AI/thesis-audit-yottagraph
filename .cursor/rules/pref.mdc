@@ -1,0 +1,128 @@
+---
+description: Apply when working with user preferences, settings persistence, usePrefsStore, the Pref class, KV storage, or app namespacing (NUXT_PUBLIC_APP_ID).
+alwaysApply: false
+---
+
+# User Preferences
+
+Preferences are persisted to Upstash Redis (KV) via `usePrefsStore()` from
+`~/composables/usePrefsStore.ts`, backed by `KVPrefsStore` which calls
+`/api/kv/*` endpoints. The KV store is provisioned automatically during
+project creation and connected via Vercel env vars (`KV_REST_API_URL`,
+`KV_REST_API_TOKEN`).
+
+## Two-Tier Namespacing
+
+Preferences are scoped by the app ID set in `NUXT_PUBLIC_APP_ID`:
+
+- **App-specific**: `/users/{userId}/apps/{appId}/settings/general`
+- **Global (cross-app)**: `/users/{userId}/global/settings/general`
+
+## The Pref Class
+
+`Pref<T>` is a reactive wrapper that auto-syncs to KV. Defined in
+`usePrefsStore.ts`.
+
+```typescript
+const myPref = new Pref<string>(docPath, 'fieldName', 'defaultValue');
+await myPref.initialize();
+
+myPref.r.value; // reactive ref (use in templates)
+myPref.v;       // getter shorthand
+myPref.set('new value'); // persists to KV
+```
+
+Values are JSON-serialized. The `Pref` sets up a watcher after
+`initialize()` so any change to `.r` auto-persists.
+
+## usePrefsStore()
+
+```typescript
+const { readDoc, listDocuments, deleteCollection } = usePrefsStore();
+```
+
+The backing store auto-initializes on first use — no need to call
+`initializePrefsStore()` manually.
+
+## Local Development
+
+KV credentials (`KV_REST_API_URL`, `KV_REST_API_TOKEN`) are only available
+in deployed builds (Vercel auto-injects them at runtime). In local dev,
+`getRedis()` returns `null` and KV routes return `undefined` for reads and
+silently skip writes. `Pref<T>` still works with its default value but
+won't persist across page refreshes.
+
+This is expected — push to `main` and test persistence on the deployed build.
+
+For local-only persistence, use `localStorage` as a lightweight alternative:
+
+```typescript
+const saved = localStorage.getItem('watchlist');
+const watchlist = ref<string[]>(saved ? JSON.parse(saved) : []);
+watch(watchlist, (val) => localStorage.setItem('watchlist', JSON.stringify(val)), { deep: true });
+```
+
+Use `Pref<T>` for production persistence and `localStorage` for local-only
+development when KV isn't available.
+
+**Auth dependency:** All `/api/kv/*` routes call `unsealCookie(event)` to
+identify the user. In dev mode (no `NUXT_PUBLIC_AUTH0_CLIENT_SECRET` set),
+this is bypassed automatically using `NUXT_PUBLIC_USER_NAME`. If you set an
+Auth0 client secret without proper cookie setup, KV writes will silently
+no-op.
+
+## Direct API Alternative
+
+If you prefer not to use the `Pref<T>` class, you can call the KV
+routes directly from client-side code:
+
+```typescript
+// Read
+const value = await $fetch('/api/kv/read', {
+  params: { docPath: '/users/abc/settings', fieldName: 'theme' }
+});
+
+// Write
+await $fetch('/api/kv/write', {
+  method: 'POST',
+  body: { docPath: '/users/abc/settings', fieldName: 'theme', value: '"dark"' }
+});
+```
+
+These routes require the browser's auth cookie — they work from client-side
+`$fetch` calls but not from server routes or external scripts. For
+server-to-server KV access, use `getRedis()` from `server/utils/redis.ts`
+directly.
+
+## Feature-Scoped Preferences
+
+Features should namespace preferences under the app's prefix:
+
+```typescript
+function useMyFeaturePrefs() {
+    const { appId } = useRuntimeConfig().public;
+    const { userId } = useUserState();
+    const path = `/users/${userId.value}/apps/${appId}/features/my-feature`;
+
+    const myPref = new Pref<boolean>(path, 'enabled', true);
+    return { myPref };
+}
+```
+
+## KV Architecture
+
+- **Server**: `server/utils/redis.ts` initializes the Upstash Redis client
+  from `KV_REST_API_URL` and `KV_REST_API_TOKEN` env vars
+- **API routes**: `server/api/kv/` (read, write, delete, documents)
+- **Client store**: `utils/kvPrefsStore.ts` implements `PrefsStore` by
+  calling the KV API routes
+- **Key format**: `prefs:users:{userId}:apps:{appId}:settings:general`
+  (doc-style paths converted to colon-separated Redis keys)
+
+## Scope Guidance
+
+| App-specific | Global |
+|---|---|
+| Layout prefs, favorites | Language |
+| Watchlists, feature settings | Accessibility |
+| Feature-specific settings | Timezone, notifications |

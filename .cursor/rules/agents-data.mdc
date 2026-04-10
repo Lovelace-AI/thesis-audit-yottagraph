@@ -1,0 +1,72 @@
+---
+description: "ADK agents calling the Elemental API via broadchurch_auth and local testing env vars."
+alwaysApply: false
+globs: agents/**
+---
+
+# Agents: Elemental API (Query Server)
+
+## Connecting to the Elemental API
+
+Use `broadchurch_auth` for all Elemental API calls. It lives at
+`agents/broadchurch_auth.py` and is automatically bundled into each agent
+directory at deploy time. It handles:
+
+- Routing through the Broadchurch Portal gateway proxy in production
+  (no direct QS credentials needed — the portal handles Auth0 M2M auth)
+- Authenticating to the proxy with a per-tenant API key from
+  `broadchurch.yaml` (`gateway.qs_api_key`)
+- Falling back to `ELEMENTAL_API_URL` + `ELEMENTAL_API_TOKEN` env vars
+  for local dev
+
+```python
+try:
+    from broadchurch_auth import elemental_client
+except ImportError:
+    from .broadchurch_auth import elemental_client
+
+def get_schema() -> dict:
+    """Get the yottagraph schema."""
+    resp = elemental_client.get("/elemental/metadata/schema")
+    resp.raise_for_status()
+    return resp.json()
+
+def find_entities(expression: str, limit: int = 10) -> dict:
+    """Search for entities."""
+    resp = elemental_client.post("/elemental/find", data={"expression": expression, "limit": str(limit)})
+    resp.raise_for_status()
+    return resp.json()
+```
+
+The try/except is required because the import path differs between local
+dev (`agents/` on sys.path → absolute import) and Agent Engine runtime
+(code packaged inside an ADK module → relative import).
+
+**Do NOT** hardcode URLs or manually handle auth tokens. Do NOT read
+`broadchurch.yaml` directly — `broadchurch_auth` handles all of this.
+
+Key endpoints:
+- `GET /elemental/metadata/schema` — entity types and properties
+- `POST /elemental/find` — search for entities by expression
+- `POST /entities/search` — search for entities by name (batch, scored)
+- `POST /elemental/entities/properties` — get entity property values
+
+Requirements for agents using the Elemental API (add to `requirements.txt`):
+```
+google-auth>=2.20.0
+pyyaml>=6.0
+```
+
+## Local testing: Elemental API env vars
+
+When testing agents locally with `adk web`, for agents that call the Elemental API:
+
+```bash
+export ELEMENTAL_API_URL=https://stable-query.lovelace.ai
+export ELEMENTAL_API_TOKEN=<your-token>
+```
+
+In production, all Elemental API calls go through the Portal Gateway at
+`{gateway_url}/api/qs/{org_id}/...`. The agent sends `X-Api-Key` (from
+`broadchurch.yaml`) and the portal injects its own Auth0 M2M token
+upstream.
