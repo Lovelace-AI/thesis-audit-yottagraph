@@ -1,0 +1,30 @@
+# Broadchurch project configuration
+# Auto-generated during tenant provisioning.
+
+gcp:
+  project: broadchurch
+  region: us-central1
+  staging_bucket: broadchurch-agent-staging
+
+tenant:
+  project_name: "thesis-audit"
+  display_name: "Thesis Audit"
+  org_id: "org_vs4tEmOKeV1d2lfY"
+  service_account: "tenant-vs4temokev1d2lfy@broadchurch.iam.gserviceaccount.com"
+
+gateway:
+  url: "https://broadchurch-portal-194773164895.us-central1.run.app"
+  qs_api_key: "7b698741245ca0cadbe4e10eb5c427a6b686f2c647f20f4b4db912d543528819"
+
+query_server:
+  url: "https://query.news.prod.g.lovelace.ai"
+  audience: "queryserver:api"
+
+auth:
+  client_id: "vQ4aOT0A5SShgOMu9DLt9fYxB6L7K0WU"
+  audience: "queryserver:api"
+
+aether:
+  data_mode: "api-mcp"
+
+agents: {}
