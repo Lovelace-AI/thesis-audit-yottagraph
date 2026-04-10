@@ -180,64 +180,74 @@ export function useThesisResearch() {
 
         let finalText = '';
 
-        // Try local stream route first, then portal
         const localUrl = `/api/agent/${engineId}/stream`;
-        const portalUrl = `${gatewayUrl}/api/agents/${orgId}/${engineId}/stream`;
+        const portalStreamUrl = `${gatewayUrl}/api/agents/${orgId}/${engineId}/stream`;
+        const portalQueryUrl = `${gatewayUrl}/api/agents/${orgId}/${engineId}/query`;
 
-        let response: Response | null = null;
-        try {
-            response = await fetch(localUrl, {
-                method: 'POST',
-                headers,
-                body: JSON.stringify(body),
-            });
-            if (!response.ok || !response.body) response = null;
-        } catch {
-            response = null;
-        }
-
-        if (!response) {
-            response = await fetch(portalUrl, {
-                method: 'POST',
-                headers,
-                body: JSON.stringify(body),
-            });
-        }
-
-        if (!response.ok || !response.body) {
-            // Fall back to buffered /query
-            const queryUrl = `${gatewayUrl}/api/agents/${orgId}/${engineId}/query`;
-            const queryResp = await $fetch<{ output: any; session_id: string | null }>(queryUrl, {
-                method: 'POST',
-                headers,
-                body,
-            });
-            if (queryResp.session_id) sessionId.value = queryResp.session_id;
-            return extractAgentText(queryResp.output);
-        }
-
-        for await (const { event, data } of readSSE(response)) {
-            if (event === 'function_call') {
-                const step: ResearchStep = {
-                    id: crypto.randomUUID(),
-                    tool: data.name || '?',
-                    args: data.args || {},
-                    label: toolLabel(data.name || '', data.args || {}),
-                    timestamp: Date.now(),
-                };
-                progress.value = [...progress.value, step];
-            } else if (event === 'text') {
-                finalText = data.text || finalText;
-            } else if (event === 'done') {
-                if (data.session_id) sessionId.value = data.session_id;
-                if (data.text) finalText = data.text;
-                break;
-            } else if (event === 'error') {
-                throw new Error(data.message || 'Agent error');
+        const processSSE = async (response: Response): Promise<string | null> => {
+            let text = '';
+            for await (const { event, data } of readSSE(response)) {
+                if (event === 'function_call') {
+                    const step: ResearchStep = {
+                        id: crypto.randomUUID(),
+                        tool: data.name || '?',
+                        args: data.args || {},
+                        label: toolLabel(data.name || '', data.args || {}),
+                        timestamp: Date.now(),
+                    };
+                    progress.value = [...progress.value, step];
+                } else if (event === 'text') {
+                    text = data.text || text;
+                } else if (event === 'done') {
+                    if (data.session_id) sessionId.value = data.session_id;
+                    if (data.text) text = data.text;
+                    break;
+                } else if (event === 'error') {
+                    return null;
+                }
             }
+            return text;
+        };
+
+        // Try local server route first (single hop to Agent Engine)
+        try {
+            const localResp = await fetch(localUrl, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(body),
+            });
+            if (localResp.ok && localResp.body) {
+                const result = await processSSE(localResp);
+                if (result !== null) return result;
+            }
+        } catch {
+            // Local route unavailable
         }
 
-        return finalText;
+        // Fall back to portal streaming proxy (handles its own auth)
+        progress.value = [];
+        try {
+            const portalResp = await fetch(portalStreamUrl, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(body),
+            });
+            if (portalResp.ok && portalResp.body) {
+                const result = await processSSE(portalResp);
+                if (result !== null) return result;
+            }
+        } catch {
+            // Portal stream unavailable
+        }
+
+        // Last resort: buffered /query endpoint
+        const queryResp = await $fetch<{ output: any; session_id: string | null }>(portalQueryUrl, {
+            method: 'POST',
+            headers,
+            body,
+        });
+        if (queryResp.session_id) sessionId.value = queryResp.session_id;
+        return extractAgentText(queryResp.output);
     }
 
     // -----------------------------------------------------------------------
