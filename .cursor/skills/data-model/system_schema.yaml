@@ -10,62 +10,62 @@
 # flavors, publications, topics, trustworthiness, etc.) belong in the
 # dataset schema.
 
-name: 'system'
-description: 'Universal infrastructure elements for all datasets'
+name: "system"
+description: "Universal infrastructure elements for all datasets"
 
 flavors:
-    - name: 'schema::flavor::event'
-      description: 'A significant occurrence extracted from source text'
-      display_name: 'Event'
-      mergeability: not_mergeable
+  - name: "schema::flavor::event"
+    description: "A significant occurrence extracted from source text"
+    display_name: "Event"
+    mergeability: not_mergeable
 
 relationships:
-    - name: 'schema::relationship::participant'
-      description: 'An entity participates in an event'
-      display_name: 'Participant'
-      mergeability: not_mergeable
-      domain_flavors: ['schema::flavor::event']
+  - name: "schema::relationship::participant"
+    description: "An entity participates in an event"
+    display_name: "Participant"
+    mergeability: not_mergeable
+    domain_flavors: ["schema::flavor::event"]
 
 properties:
-    - name: 'schema::property::event_category'
-      type: string
-      description: 'The category of an event (e.g., Bankruptcy, IPO, Layoffs)'
-      display_name: 'Event Category'
-      mergeability: not_mergeable
-      domain_flavors: ['schema::flavor::event']
+  - name: "schema::property::event_category"
+    type: string
+    description: "The category of an event (e.g., Bankruptcy, IPO, Layoffs)"
+    display_name: "Event Category"
+    mergeability: not_mergeable
+    domain_flavors: ["schema::flavor::event"]
 
-    - name: 'schema::property::event_likelihood'
-      type: string
-      description: 'Temporal status of an event: confirmed, ongoing, likely, or speculative'
-      display_name: 'Event Likelihood'
-      mergeability: not_mergeable
-      domain_flavors: ['schema::flavor::event']
+  - name: "schema::property::event_likelihood"
+    type: string
+    description: "Temporal status of an event: confirmed, ongoing, likely, or speculative"
+    display_name: "Event Likelihood"
+    mergeability: not_mergeable
+    domain_flavors: ["schema::flavor::event"]
 
-    - name: 'schema::property::event_date'
-      type: string
-      description: 'The date an event occurred in YYYY-MM-DD format (or YYYY-MM or YYYY for partial dates)'
-      display_name: 'Event Date'
-      mergeability: not_mergeable
-      domain_flavors: ['schema::flavor::event']
+  - name: "schema::property::event_date"
+    type: string
+    description: "The date an event occurred in YYYY-MM-DD format (or YYYY-MM or YYYY for partial dates)"
+    display_name: "Event Date"
+    mergeability: not_mergeable
+    domain_flavors: ["schema::flavor::event"]
 
-    - name: 'schema::property::event_description'
-      type: string
-      description: 'A detailed, objective description of an event'
-      display_name: 'Event Description'
-      mergeability: not_mergeable
-      domain_flavors: ['schema::flavor::event']
+  - name: "schema::property::event_description"
+    type: string
+    description: "A detailed, objective description of an event"
+    display_name: "Event Description"
+    mergeability: not_mergeable
+    domain_flavors: ["schema::flavor::event"]
 
 attributes:
-    - property: 'schema::relationship::participant'
-      name: 'role'
-      type: string
-      description: "The entity's role in the event (e.g., acquirer, target, plaintiff)"
-      display_name: 'Role'
-      mergeability: not_mergeable
+  - property: "schema::relationship::participant"
+    name: "role"
+    type: string
+    description: "The entity's role in the event (e.g., acquirer, target, plaintiff)"
+    display_name: "Role"
+    mergeability: not_mergeable
 
-    - property: 'schema::relationship::participant'
-      name: 'sentiment'
-      type: float
-      description: "Impact score for this entity's involvement in the event"
-      display_name: 'Sentiment'
-      mergeability: not_mergeable
+  - property: "schema::relationship::participant"
+    name: "sentiment"
+    type: float
+    description: "Impact score for this entity's involvement in the event"
+    display_name: "Sentiment"
+    mergeability: not_mergeable
