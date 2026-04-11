@@ -967,7 +967,8 @@ _research_doc: dict | None = None
 _full_results: dict = {}
 _call_counter: int = 0
 _iteration_counter: int = 0
-MAX_ITERATIONS = 10
+_max_iterations: int = 5
+DEFAULT_MAX_ITERATIONS = 5
 
 
 def research_iteration(input_json: str = "") -> str:
@@ -985,11 +986,15 @@ def research_iteration(input_json: str = "") -> str:
     Returns:
         JSON string with iteration results or final output.
     """
-    global _research_doc, _full_results, _call_counter, _iteration_counter
+    global _research_doc, _full_results, _call_counter, _iteration_counter, _max_iterations
     _load_schema()
 
     if _research_doc is None:
         query_input = json.loads(input_json) if input_json else {}
+        _max_iterations = query_input.pop("max_iterations", DEFAULT_MAX_ITERATIONS)
+        if not isinstance(_max_iterations, int) or _max_iterations < 1:
+            _max_iterations = DEFAULT_MAX_ITERATIONS
+        _max_iterations = min(_max_iterations, 20)
         _research_doc = {"query": query_input, "calls": []}
         _full_results = {}
         _call_counter = 0
@@ -997,7 +1002,7 @@ def research_iteration(input_json: str = "") -> str:
 
     _iteration_counter += 1
 
-    if _iteration_counter > MAX_ITERATIONS:
+    if _iteration_counter > _max_iterations:
         result = _build_final_result("Maximum iterations reached.")
         _reset_state()
         return json.dumps(result, default=str)
@@ -1058,11 +1063,12 @@ def _build_final_result(reasoning: str) -> dict:
 
 def _reset_state() -> None:
     """Reset module-level state after research completes."""
-    global _research_doc, _full_results, _call_counter, _iteration_counter
+    global _research_doc, _full_results, _call_counter, _iteration_counter, _max_iterations
     _research_doc = None
     _full_results = {}
     _call_counter = 0
     _iteration_counter = 0
+    _max_iterations = DEFAULT_MAX_ITERATIONS
 
 
 # ---------------------------------------------------------------------------

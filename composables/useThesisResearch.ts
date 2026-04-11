@@ -638,6 +638,7 @@ export function useThesisResearch() {
         errorDetail.value = null;
 
         try {
+            const { maxIterations } = useResearchSettings();
             const researchInput = {
                 thesis_plaintext: qr.thesis_plaintext,
                 entities: qr.entities
@@ -649,6 +650,7 @@ export function useThesisResearch() {
                     })),
                 claims: qr.claims,
                 data_needs: qr.data_needs,
+                max_iterations: maxIterations.value,
             };
 
             const { text: researchText, researchData } = await sendToAgent(

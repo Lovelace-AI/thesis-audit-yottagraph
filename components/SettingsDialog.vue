@@ -14,6 +14,34 @@
             <v-container>
                 <v-row>
                     <v-col cols="12">
+                        <h3 class="text-h6 mb-2">Research</h3>
+                        <div class="d-flex align-center ga-4 mt-3">
+                            <div class="flex-grow-1">
+                                <div class="text-body-2">Max research iterations</div>
+                                <div class="text-caption text-medium-emphasis">
+                                    How many planner loops the researcher agent runs before
+                                    stopping. Higher values produce more thorough research but take
+                                    longer.
+                                </div>
+                            </div>
+                            <v-text-field
+                                v-model.number="maxIterations"
+                                type="number"
+                                min="1"
+                                max="20"
+                                density="compact"
+                                variant="outlined"
+                                hide-details
+                                style="max-width: 90px; flex-shrink: 0"
+                            />
+                        </div>
+                    </v-col>
+                </v-row>
+
+                <v-divider class="my-4" />
+
+                <v-row>
+                    <v-col cols="12">
                         <h3 class="text-h6 mb-2">Server Configuration</h3>
                         <div class="mt-3">
                             <div class="text-body-2 mb-1">Current Query Server:</div>
@@ -41,9 +69,12 @@
 
 <script setup lang="ts">
     import { state } from '~/utils/appState';
+    import { useResearchSettings } from '~/composables/useResearchSettings';
 
     const config = useRuntimeConfig();
     const currentQueryServer = computed(() => config.public.queryServerAddress as string);
+
+    const { maxIterations } = useResearchSettings();
 </script>
 
 <style scoped>
