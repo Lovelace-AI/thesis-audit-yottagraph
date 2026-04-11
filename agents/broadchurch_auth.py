@@ -165,7 +165,11 @@ class _ElementalClient:
     def post(self, path: str, **kwargs) -> httpx.Response:
         kwargs.setdefault("timeout", self._timeout)
         headers = kwargs.pop("headers", {})
-        headers.update(get_auth_headers())
+        if "json" in kwargs:
+            headers.setdefault("Content-Type", "application/json")
+        else:
+            headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+        headers.update(self._headers())
         return httpx.post(f"{self.base_url}{path}", headers=headers, **kwargs)
 
 

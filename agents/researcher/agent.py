@@ -27,6 +27,61 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# Schema cache — PID ↔ name mapping loaded once from the Elemental API
+# ---------------------------------------------------------------------------
+
+_pid_to_name: dict[int, str] = {}
+_name_to_pid: dict[str, int] = {}
+_schema_loaded = False
+
+_PRICE_FIELDS = ("open_price", "high_price", "low_price", "close_price", "trading_volume")
+_FILING_FIELDS = (
+    "accession_number", "form_type", "filing_date", "total_revenue", "net_income",
+    "total_assets", "total_liabilities", "shareholders_equity", "shares_outstanding",
+    "eps_basic", "eps_diluted",
+)
+_EVENT_FIELDS = (
+    "category", "form_8k_event", "form_8k_item_code", "event_status",
+    "likelihood", "description", "date",
+)
+_NEWS_FIELDS = ("title", "sentiment", "original_publication_name", "tone", "title_factuality")
+
+_TICKER_PIDS: set[int] = set()
+_PRICE_PIDS: set[int] = set()
+
+
+def _load_schema() -> None:
+    """Fetch the KG schema and build PID↔name maps. Idempotent."""
+    global _schema_loaded, _TICKER_PIDS, _PRICE_PIDS
+    if _schema_loaded:
+        return
+    try:
+        resp = elemental_client.get("/elemental/metadata/schema")
+        resp.raise_for_status()
+        schema = resp.json().get("schema", resp.json())
+        for p in schema.get("properties", []):
+            pid = p.get("pid")
+            name = p.get("name", "")
+            if pid is not None and name:
+                _pid_to_name[pid] = name
+                _name_to_pid[name] = pid
+        _TICKER_PIDS = {
+            _name_to_pid.get("ticker_symbol", 0),
+            _name_to_pid.get("ticker", 0),
+        } - {0}
+        _PRICE_PIDS = {_name_to_pid[n] for n in _PRICE_FIELDS if n in _name_to_pid}
+    except Exception:
+        pass
+    _schema_loaded = True
+
+
+def _pname(pid: int) -> str:
+    """Resolve a PID to its property name, loading schema if needed."""
+    _load_schema()
+    return _pid_to_name.get(pid, "")
+
+
+# ---------------------------------------------------------------------------
 # In-memory accumulator keyed by session
 # ---------------------------------------------------------------------------
 
@@ -69,6 +124,7 @@ def get_news(entity_name: str, neid: str) -> str:
         Summary of articles found (count, date range, sentiment).
     """
     global _active_session_id
+    _load_schema()
     sid, session = _get_session(_active_session_id)
     _active_session_id = sid
     bucket = _ensure_entity(session, entity_name, neid)
@@ -80,20 +136,14 @@ def get_news(entity_name: str, neid: str) -> str:
         })
         resp = elemental_client.post(
             "/elemental/find",
-            data={"expression": linked_expr, "limit": "50"},
+            data={"expression": linked_expr, "limit": "30"},
         )
         resp.raise_for_status()
         eids = resp.json().get("eids", [])
         if not eids:
             return f"No linked entities found for '{entity_name}'."
 
-        props_resp = elemental_client.post(
-            "/elemental/entities/properties",
-            data={"eids": json.dumps(eids[:30]), "include_attributes": "true"},
-        )
-        props_resp.raise_for_status()
-        values = props_resp.json().get("values", [])
-
+        values = _fetch_properties_batched(eids[:20], timeout=10.0)
         articles = _extract_news(values)
         bucket.setdefault("news", []).extend(articles)
 
@@ -117,6 +167,12 @@ def get_news(entity_name: str, neid: str) -> str:
 def get_stock_prices(entity_name: str, neid: str) -> str:
     """Fetch OHLCV stock price data for an entity.
 
+    Tries several strategies to locate price data:
+    1. Direct property fetch on the entity (works for most stocks)
+    2. If timeout, look up ticker via PID 169 on the organization entity
+       and search for the financial_instrument entity by ticker
+    3. Fall back to financial fundamentals from the org entity
+
     Args:
         entity_name: Display name of the entity.
         neid: The 20-digit entity ID.
@@ -125,55 +181,81 @@ def get_stock_prices(entity_name: str, neid: str) -> str:
         Summary of price data found (count, date range, price range).
     """
     global _active_session_id
+    _load_schema()
     sid, session = _get_session(_active_session_id)
     _active_session_id = sid
     bucket = _ensure_entity(session, entity_name, neid)
 
+    prices: list[dict] = []
+    ticker = None
+
+    # Strategy 1: direct fetch on the provided entity
     try:
-        props_resp = elemental_client.post(
-            "/elemental/entities/properties",
-            data={"eids": json.dumps([neid]), "include_attributes": "true"},
-        )
-        props_resp.raise_for_status()
-        values = props_resp.json().get("values", [])
-
+        values = _fetch_properties([neid], timeout=15.0)
         prices = _extract_prices(values)
+        ticker = _extract_ticker(values)
+    except Exception:
+        pass
 
-        if not prices:
-            linked_expr = json.dumps({
-                "type": "linked",
-                "linked": {"to_entity": neid, "distance": 1, "direction": "both"},
-            })
-            find_resp = elemental_client.post(
-                "/elemental/find",
-                data={"expression": linked_expr, "limit": "20"},
-            )
-            find_resp.raise_for_status()
-            linked_eids = find_resp.json().get("eids", [])
-            if linked_eids:
-                props2 = elemental_client.post(
-                    "/elemental/entities/properties",
-                    data={"eids": json.dumps(linked_eids[:10]), "include_attributes": "true"},
-                )
-                props2.raise_for_status()
-                prices = _extract_prices(props2.json().get("values", []))
+    # Strategy 2: find the financial_instrument by ticker or name
+    if not prices:
+        if not ticker:
+            ticker = _get_ticker_for_entity(neid)
+        fi_neid = None
+        if ticker:
+            fi_neid = _find_financial_instrument(ticker)
+        if not fi_neid:
+            fi_neid = _find_financial_instrument(entity_name)
+        if fi_neid and fi_neid != neid:
+            try:
+                values2 = _fetch_properties([fi_neid], timeout=15.0)
+                prices = _extract_prices(values2)
+                if not ticker:
+                    ticker = _extract_ticker(values2)
+            except Exception:
+                pass
 
-        bucket.setdefault("stock_prices", []).extend(prices)
+    # Strategy 3: financial fundamentals from the EDGAR organization entity
+    if not prices:
+        org_neid = _find_organization_with_data(entity_name)
+        if org_neid:
+            try:
+                values3 = _fetch_properties([org_neid], timeout=15.0)
+                fundamentals = _extract_fundamentals(values3)
+                if fundamentals:
+                    bucket["financial_fundamentals"] = fundamentals
+                    if not ticker:
+                        ticker = _extract_ticker(values3)
+            except Exception:
+                pass
 
-        if not prices:
-            return f"No stock price data found for '{entity_name}'."
+    if ticker:
+        bucket["ticker"] = ticker
 
+    bucket.setdefault("stock_prices", []).extend(prices)
+
+    if not prices and not bucket.get("financial_fundamentals"):
+        return f"No stock price data found for '{entity_name}'."
+
+    parts = []
+    if prices:
         dates = [p["date"] for p in prices if p.get("date")]
         closes = [p["close"] for p in prices if p.get("close") is not None]
         date_range = f"{min(dates)} to {max(dates)}" if dates else "unknown"
         price_range = f"${min(closes):.2f} – ${max(closes):.2f}" if closes else "unknown"
-
-        return (
-            f"Found {len(prices)} price data point(s) for '{entity_name}'. "
-            f"Date range: {date_range}. Close price range: {price_range}."
+        parts.append(
+            f"Found {len(prices)} OHLCV data point(s) for '{entity_name}'"
+            + (f" (ticker: {ticker})" if ticker else "")
+            + f". Date range: {date_range}. Close price range: {price_range}."
         )
-    except Exception as e:
-        return f"Error fetching stock data for '{entity_name}': {e}"
+    if bucket.get("financial_fundamentals"):
+        f = bucket["financial_fundamentals"]
+        parts.append(
+            f"Financial fundamentals: revenue=${f.get('total_revenue', '?')}, "
+            f"net_income=${f.get('net_income', '?')}, "
+            f"shares_outstanding={f.get('shares_outstanding', '?')}."
+        )
+    return " ".join(parts)
 
 
 def get_filings(entity_name: str, neid: str) -> str:
@@ -187,6 +269,7 @@ def get_filings(entity_name: str, neid: str) -> str:
         Summary of filings found (count, form types, date range).
     """
     global _active_session_id
+    _load_schema()
     sid, session = _get_session(_active_session_id)
     _active_session_id = sid
     bucket = _ensure_entity(session, entity_name, neid)
@@ -198,20 +281,14 @@ def get_filings(entity_name: str, neid: str) -> str:
         })
         resp = elemental_client.post(
             "/elemental/find",
-            data={"expression": linked_expr, "limit": "50"},
+            data={"expression": linked_expr, "limit": "30"},
         )
         resp.raise_for_status()
         eids = resp.json().get("eids", [])
         if not eids:
             return f"No filings found for '{entity_name}'."
 
-        props_resp = elemental_client.post(
-            "/elemental/entities/properties",
-            data={"eids": json.dumps(eids[:30]), "include_attributes": "true"},
-        )
-        props_resp.raise_for_status()
-        values = props_resp.json().get("values", [])
-
+        values = _fetch_properties_batched(eids[:20], timeout=10.0)
         filings = _extract_filings(values)
         bucket.setdefault("filings", []).extend(filings)
 
@@ -241,6 +318,7 @@ def get_events(entity_name: str, neid: str) -> str:
         Summary of events found (count, categories).
     """
     global _active_session_id
+    _load_schema()
     sid, session = _get_session(_active_session_id)
     _active_session_id = sid
     bucket = _ensure_entity(session, entity_name, neid)
@@ -252,20 +330,14 @@ def get_events(entity_name: str, neid: str) -> str:
         })
         resp = elemental_client.post(
             "/elemental/find",
-            data={"expression": linked_expr, "limit": "50"},
+            data={"expression": linked_expr, "limit": "30"},
         )
         resp.raise_for_status()
         eids = resp.json().get("eids", [])
         if not eids:
             return f"No events found for '{entity_name}'."
 
-        props_resp = elemental_client.post(
-            "/elemental/entities/properties",
-            data={"eids": json.dumps(eids[:30]), "include_attributes": "true"},
-        )
-        props_resp.raise_for_status()
-        values = props_resp.json().get("values", [])
-
+        values = _fetch_properties_batched(eids[:20], timeout=10.0)
         events = _extract_events(values)
         bucket.setdefault("events", []).extend(events)
 
@@ -313,6 +385,7 @@ def get_relationships(entity_name: str, neid: str) -> str:
         names_resp = elemental_client.post(
             "/entities/names",
             json={"neids": eids[:30]},
+            timeout=10.0,
         )
         names_resp.raise_for_status()
         names_map = names_resp.json().get("results", {})
@@ -336,65 +409,98 @@ def get_relationships(entity_name: str, neid: str) -> str:
 
 
 def get_macro(query: str) -> str:
-    """Search for macroeconomic data series (FRED).
+    """Search for macroeconomic concepts and their related entities.
+
+    Uses the ``economic_concept`` entity flavor to find concepts like
+    "federal funds rate", "GDP", "CPI", etc., then resolves their
+    relationships (``financially_impacts``, ``appears_in``) to discover
+    which financial instruments and organizations are affected.
 
     Args:
         query: Natural language description (e.g. "federal funds rate", "GDP growth").
 
     Returns:
-        Summary of matching data series (count, names, latest values).
+        Summary of matching concepts and impacted entities.
     """
     global _active_session_id
+    _load_schema()
     sid, session = _get_session(_active_session_id)
     _active_session_id = sid
 
     try:
-        find_expr = json.dumps({
-            "type": "comparison",
-            "comparison": {"operator": "string_like", "pid": 8, "value": query},
-        })
         resp = elemental_client.post(
-            "/elemental/find",
-            data={"expression": find_expr, "limit": "20"},
+            "/entities/search",
+            json={
+                "queries": [{"queryId": 1, "query": query, "flavors": ["economic_concept"]}],
+                "maxResults": 5,
+                "includeNames": True,
+                "includeFlavors": True,
+                "includeScores": True,
+                "minScore": 0.3,
+            },
+            timeout=10.0,
         )
         resp.raise_for_status()
-        eids = resp.json().get("eids", [])
-        if not eids:
-            return f"No macro data series found matching '{query}'."
+        matches = resp.json().get("results", [{}])[0].get("matches", [])
+        if not matches:
+            return f"No macro/economic concepts found matching '{query}'."
 
-        props_resp = elemental_client.post(
-            "/elemental/entities/properties",
-            data={"eids": json.dumps(eids[:10])},
-        )
-        props_resp.raise_for_status()
-        values = props_resp.json().get("values", [])
+        concepts: list[dict] = []
+        for m in matches[:3]:
+            concept: dict = {
+                "neid": m.get("neid", ""),
+                "name": m.get("name", ""),
+                "score": m.get("score"),
+            }
 
-        by_entity: dict[str, dict] = {}
-        for v in values:
-            eid = v.get("eid", "")
-            if eid not in by_entity:
-                by_entity[eid] = {"neid": eid}
-            pid = v.get("pid")
-            val = v.get("value")
-            name_str = str(v.get("name", "")).lower()
-            if pid == 8:
-                by_entity[eid]["name"] = val
-            elif "fred_series_id" in name_str and val:
-                by_entity[eid]["fred_series_id"] = str(val)
-            elif "release_link" in name_str and val:
-                by_entity[eid]["release_link"] = str(val)
-            else:
-                by_entity[eid].setdefault("data_points", []).append(
-                    {"pid": pid, "value": val, "recorded_at": v.get("recorded_at", "")}
-                )
+            concept_neid = concept["neid"]
+            try:
+                values = _fetch_properties([concept_neid], timeout=10.0)
+                fi_pid = _name_to_pid.get("financially_impacts")
+                appears_pid = _name_to_pid.get("appears_in")
+                impacted_neids: list[str] = []
+                for v in values:
+                    pid = v.get("pid")
+                    val = v.get("value")
+                    if pid == fi_pid and val:
+                        impacted_neids.append(str(val))
+                    pname = _pname(pid) if pid else ""
+                    if pname and pname not in ("appears_in", "financially_impacts"):
+                        concept.setdefault("properties", {})[pname] = val
 
-        series_list = list(by_entity.values())
-        session.setdefault("macro_data", {})[query] = series_list
+                if impacted_neids:
+                    names_resp = elemental_client.post(
+                        "/entities/names",
+                        json={"neids": impacted_neids[:10]},
+                        timeout=10.0,
+                    )
+                    names_resp.raise_for_status()
+                    names_map = names_resp.json().get("results", {})
+                    concept["impacts"] = [
+                        {"neid": neid, "name": names_map.get(neid, neid)}
+                        for neid in impacted_neids[:10]
+                    ]
+            except Exception:
+                pass
 
-        series_names = [s.get("name", s.get("neid", "?")) for s in series_list[:5]]
+            concepts.append(concept)
+
+        session.setdefault("macro_data", {})[query] = concepts
+
+        summaries = []
+        for c in concepts:
+            detail = c["name"]
+            impacts = c.get("impacts", [])
+            if impacts:
+                impact_names = [i["name"] for i in impacts[:5]]
+                detail += f" → impacts: {', '.join(impact_names)}"
+                if len(impacts) > 5:
+                    detail += f" (+{len(impacts) - 5} more)"
+            summaries.append(detail)
+
         return (
-            f"Found {len(series_list)} macro data series matching '{query}': "
-            f"{', '.join(series_names)}."
+            f"Found {len(concepts)} economic concept(s) matching '{query}': "
+            f"{'; '.join(summaries)}."
         )
     except Exception as e:
         return f"Error searching macro data for '{query}': {e}"
@@ -411,27 +517,23 @@ def get_entity_properties(entity_name: str, neid: str) -> str:
         Summary of properties found (count, property names).
     """
     global _active_session_id
+    _load_schema()
     sid, session = _get_session(_active_session_id)
     _active_session_id = sid
     bucket = _ensure_entity(session, entity_name, neid)
 
     try:
-        props_resp = elemental_client.post(
-            "/elemental/entities/properties",
-            data={"eids": json.dumps([neid]), "include_attributes": "true"},
-        )
-        props_resp.raise_for_status()
-        values = props_resp.json().get("values", [])
+        values = _fetch_properties([neid], include_attrs=True)
 
         bucket.setdefault("properties", []).extend(values)
 
         unique_pids = list({v.get("pid") for v in values})
-        prop_names = list({str(v.get("name", "")) for v in values if v.get("name")})[:10]
+        prop_names = sorted({_pname(pid) for pid in unique_pids if _pname(pid)})[:15]
 
         return (
             f"Found {len(values)} property value(s) for '{entity_name}' "
             f"across {len(unique_pids)} unique properties. "
-            f"Property names include: {', '.join(prop_names)}."
+            f"Properties: {', '.join(prop_names) if prop_names else '(PIDs not in schema)'}."
         )
     except Exception as e:
         return f"Error fetching properties for '{entity_name}': {e}"
@@ -463,8 +565,227 @@ def finalize_research() -> str:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _fetch_properties(
+    eids: list[str], include_attrs: bool = False, timeout: float = 30.0
+) -> list[dict]:
+    """Fetch property values for a list of entity IDs."""
+    data: dict[str, str] = {"eids": json.dumps(eids)}
+    if include_attrs:
+        data["include_attributes"] = "true"
+    resp = elemental_client.post(
+        "/elemental/entities/properties", data=data, timeout=timeout
+    )
+    resp.raise_for_status()
+    return resp.json().get("values") or []
+
+
+def _fetch_properties_batched(
+    eids: list[str], include_attrs: bool = False, timeout: float = 10.0, batch_size: int = 5
+) -> list[dict]:
+    """Fetch properties in small batches to avoid timeouts on mega-entities.
+
+    If a batch times out, individual entities in that batch are tried one
+    at a time so a single problematic entity doesn't block the rest.
+    """
+    all_values: list[dict] = []
+    for i in range(0, len(eids), batch_size):
+        batch = eids[i : i + batch_size]
+        try:
+            all_values.extend(_fetch_properties(batch, include_attrs, timeout))
+        except Exception:
+            for eid in batch:
+                try:
+                    all_values.extend(_fetch_properties([eid], include_attrs, timeout))
+                except Exception:
+                    pass
+    return all_values
+
+
+def _extract_ticker(values: list[dict]) -> str | None:
+    """Pull the ticker symbol out of a property-value list."""
+    for v in values:
+        if v.get("pid") in _TICKER_PIDS:
+            val = v.get("value")
+            if val and isinstance(val, str) and len(val) <= 10:
+                return val
+    return None
+
+
+def _find_financial_instrument(ticker: str) -> str | None:
+    """Search for a financial_instrument entity by ticker symbol.
+
+    Prefers entities whose name exactly matches the ticker (these are the
+    stocks-source entities with actual OHLCV data, as opposed to the larger
+    13F-HR merged entities named like "Company Inc.").
+    """
+    try:
+        resp = elemental_client.post(
+            "/entities/search",
+            json={
+                "queries": [{"queryId": 1, "query": ticker, "flavors": ["financial_instrument"]}],
+                "maxResults": 5,
+                "includeNames": True,
+                "includeFlavors": True,
+                "includeScores": True,
+                "minScore": 0.5,
+            },
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        matches = resp.json().get("results", [{}])[0].get("matches", [])
+        exact = [m for m in matches if m.get("name", "").upper() == ticker.upper()]
+        if exact:
+            return exact[0]["neid"]
+        for m in matches:
+            if m.get("flavor") == "financial_instrument":
+                return m["neid"]
+    except Exception:
+        pass
+    return None
+
+
+def _find_organization(name: str) -> str | None:
+    """Search for an organization entity by name.
+
+    Tries both the raw name and with common corporate suffixes to improve
+    resolution accuracy (e.g. "Netflix" alone may match subsidiaries before
+    the parent, while "Netflix Inc" matches the parent directly).
+    """
+    candidates = [name]
+    lower = name.lower().rstrip(".")
+    if not any(s in lower for s in ("inc", "corp", "ltd", "llc", "co.", "company")):
+        candidates.append(f"{name} Inc")
+
+    for query in candidates:
+        try:
+            resp = elemental_client.post(
+                "/entities/search",
+                json={
+                    "queries": [{"queryId": 1, "query": query, "flavors": ["organization"]}],
+                    "maxResults": 3,
+                    "includeNames": True,
+                    "includeFlavors": True,
+                    "includeScores": True,
+                    "minScore": 0.5,
+                },
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+            matches = resp.json().get("results", [{}])[0].get("matches", [])
+            if matches and matches[0].get("score", 0) >= 0.8:
+                return matches[0]["neid"]
+        except Exception:
+            pass
+    return None
+
+
+def _find_organization_with_data(name: str) -> str | None:
+    """Search for an organization entity that has EDGAR/financial data.
+
+    Prefers organizations with properties like ticker/CIK (EDGAR-sourced)
+    over NLP-sourced organizations that only have relationship properties.
+    Returns up to 3 candidates and probes each briefly for financial data.
+    """
+    candidates = [name]
+    lower = name.lower().rstrip(".")
+    if not any(s in lower for s in ("inc", "corp", "ltd", "llc", "co.", "company")):
+        candidates.append(f"{name} Inc")
+
+    all_matches: list[dict] = []
+    for query in candidates:
+        try:
+            resp = elemental_client.post(
+                "/entities/search",
+                json={
+                    "queries": [{"queryId": 1, "query": query, "flavors": ["organization"]}],
+                    "maxResults": 5,
+                    "includeNames": True,
+                    "includeFlavors": True,
+                    "includeScores": True,
+                    "minScore": 0.5,
+                },
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+            matches = resp.json().get("results", [{}])[0].get("matches", [])
+            for m in matches:
+                if m.get("score", 0) >= 0.5 and m["neid"] not in {x["neid"] for x in all_matches}:
+                    all_matches.append(m)
+        except Exception:
+            pass
+
+    ticker_pid = _name_to_pid.get("ticker")
+    cik_pid = _name_to_pid.get("company_cik")
+
+    for m in all_matches[:5]:
+        neid = m["neid"]
+        try:
+            vals = _fetch_properties([neid], timeout=10.0)
+            has_data = any(
+                v.get("pid") in (ticker_pid, cik_pid)
+                for v in vals
+                if v.get("pid")
+            )
+            if has_data:
+                return neid
+        except Exception:
+            pass
+
+    if all_matches:
+        return all_matches[0]["neid"]
+    return None
+
+
+def _get_ticker_for_entity(neid: str) -> str | None:
+    """Try to get a ticker by querying the entity or its organization."""
+    try:
+        values = _fetch_properties([neid], timeout=10.0)
+        ticker = _extract_ticker(values)
+        if ticker:
+            return ticker
+    except Exception:
+        pass
+    try:
+        name_resp = elemental_client.get(f"/entities/{neid}/name", timeout=5.0)
+        name_resp.raise_for_status()
+        entity_name = name_resp.json().get("name", "")
+        org_neid = _find_organization(entity_name)
+        if org_neid and org_neid != neid:
+            org_values = _fetch_properties([org_neid], timeout=10.0)
+            return _extract_ticker(org_values)
+    except Exception:
+        pass
+    return None
+
+
+def _extract_fundamentals(values: list[dict]) -> dict:
+    """Extract financial fundamentals from an organization entity."""
+    latest: dict[str, tuple[str, any]] = {}
+    for v in values:
+        pname = _pname(v.get("pid", 0))
+        if not pname:
+            continue
+        recorded = v.get("recorded_at", "")
+        if pname in latest:
+            if recorded > latest[pname][0]:
+                latest[pname] = (recorded, v.get("value"))
+        else:
+            latest[pname] = (recorded, v.get("value"))
+
+    result: dict[str, any] = {}
+    for field in _FILING_FIELDS:
+        if field in latest:
+            result[field] = latest[field][1]
+    return result
+
 
 def _extract_news(values: list[dict]) -> list[dict]:
+    _load_schema()
+    title_pid = _name_to_pid.get("title")
+    sentiment_pid = _name_to_pid.get("sentiment")
+    pub_name_pid = _name_to_pid.get("original_publication_name")
+    tone_pid = _name_to_pid.get("tone")
+
     by_entity: dict[str, dict] = {}
     for v in values:
         eid = v.get("eid", "")
@@ -472,16 +793,22 @@ def _extract_news(values: list[dict]) -> list[dict]:
             by_entity[eid] = {"neid": eid}
         pid = v.get("pid")
         val = v.get("value")
-        if pid == 8:
+        if pid == title_pid and val:
             by_entity[eid]["title"] = val
-        by_entity[eid]["date"] = by_entity[eid].get("date") or v.get("recorded_at", "")
-        attrs = v.get("attributes", {})
-        if attrs:
-            for _aid, attr_val in attrs.items():
-                if isinstance(attr_val, str) and attr_val.startswith("http"):
-                    by_entity[eid]["url"] = attr_val
-                elif isinstance(attr_val, (int, float)) and -1 <= attr_val <= 1:
-                    by_entity[eid]["sentiment"] = attr_val
+        elif pid == sentiment_pid and val is not None:
+            try:
+                by_entity[eid]["sentiment"] = float(val)
+            except (ValueError, TypeError):
+                pass
+        elif pid == pub_name_pid and val:
+            by_entity[eid]["source"] = val
+        elif pid == tone_pid and val:
+            by_entity[eid]["tone"] = val
+
+        if not by_entity[eid].get("date"):
+            recorded = v.get("recorded_at", "")
+            if recorded:
+                by_entity[eid]["date"] = recorded
 
     articles = []
     for eid, info in by_entity.items():
@@ -491,30 +818,40 @@ def _extract_news(values: list[dict]) -> list[dict]:
                 "title": info["title"],
                 "date": (info.get("date") or "")[:10],
                 "sentiment": info.get("sentiment"),
-                "url": info.get("url"),
+                "source": info.get("source"),
+                "tone": info.get("tone"),
             })
     articles.sort(key=lambda a: a.get("date", ""), reverse=True)
     return articles
 
 
 def _extract_prices(values: list[dict]) -> list[dict]:
+    """Extract OHLCV price data using PID→name mapping."""
+    _load_schema()
+    price_field_map: dict[int, str] = {}
+    for name in _PRICE_FIELDS:
+        pid = _name_to_pid.get(name)
+        if pid is not None:
+            short = name.replace("_price", "").replace("trading_", "")
+            price_field_map[pid] = short
+
     price_points: dict[str, dict] = {}
     ticker = None
     for v in values:
-        name_str = str(v.get("name", "")).lower()
+        pid = v.get("pid")
         val = v.get("value")
-        if "ticker" in name_str and val:
+        if pid in _TICKER_PIDS and val:
             ticker = str(val)
+        field = price_field_map.get(pid)
+        if not field:
+            continue
         recorded = v.get("recorded_at", "")
         date_key = recorded[:10] if recorded else ""
         if not date_key:
             continue
         if date_key not in price_points:
             price_points[date_key] = {"date": date_key}
-        for key in ("open", "high", "low", "close", "volume"):
-            if key in name_str:
-                price_points[date_key][key] = val
-                break
+        price_points[date_key][field] = val
 
     result = sorted(price_points.values(), key=lambda p: p.get("date", ""), reverse=True)
     for p in result:
@@ -524,6 +861,15 @@ def _extract_prices(values: list[dict]) -> list[dict]:
 
 
 def _extract_filings(values: list[dict]) -> list[dict]:
+    _load_schema()
+    accession_pid = _name_to_pid.get("accession_number")
+    form_type_pid = _name_to_pid.get("form_type")
+    filing_date_pid = _name_to_pid.get("filing_date")
+    report_date_pid = _name_to_pid.get("report_date")
+    transaction_type_pid = _name_to_pid.get("transaction_type")
+    shares_transacted_pid = _name_to_pid.get("shares_transacted")
+    name_pid = 8
+
     by_entity: dict[str, dict] = {}
     for v in values:
         eid = v.get("eid", "")
@@ -531,53 +877,89 @@ def _extract_filings(values: list[dict]) -> list[dict]:
             by_entity[eid] = {"neid": eid}
         pid = v.get("pid")
         val = v.get("value")
-        name_str = str(v.get("name", "")).lower()
-        if pid == 8:
-            by_entity[eid]["description"] = val
-        if "accession" in name_str and val:
+        if pid == name_pid and val:
+            by_entity[eid]["description"] = str(val)
+        elif pid == accession_pid and val:
             by_entity[eid]["accession_number"] = str(val)
-        by_entity[eid].setdefault("date", v.get("recorded_at", "")[:10])
-        val_str = str(val).lower() if val else ""
-        for form in ["10-k", "10-q", "8-k", "def 14a", "13f", "sc 13"]:
-            if form in val_str:
-                by_entity[eid]["form_type"] = val
-                break
+        elif pid == form_type_pid and val:
+            by_entity[eid]["form_type"] = str(val)
+        elif pid == filing_date_pid and val:
+            by_entity[eid]["filing_date"] = str(val)
+        elif pid == report_date_pid and val:
+            by_entity[eid]["report_date"] = str(val)
+        elif pid == transaction_type_pid and val:
+            by_entity[eid]["transaction_type"] = str(val)
+            by_entity[eid].setdefault("form_type", "Form 4")
+        elif pid == shares_transacted_pid and val:
+            by_entity[eid]["shares_transacted"] = val
+
+        if not by_entity[eid].get("date"):
+            recorded = v.get("recorded_at", "")
+            if recorded:
+                by_entity[eid]["date"] = recorded[:10]
 
     filings = []
     for eid, info in by_entity.items():
-        if info.get("form_type") or info.get("description"):
-            filings.append({
-                "neid": info.get("neid", eid),
-                "form_type": info.get("form_type", "Unknown"),
-                "date": info.get("date", "?"),
-                "description": info.get("description", ""),
-                "accession_number": info.get("accession_number"),
-            })
+        if not (info.get("accession_number") or info.get("form_type")):
+            continue
+        entry: dict = {
+            "neid": info.get("neid", eid),
+            "form_type": info.get("form_type", "Unknown"),
+            "date": info.get("filing_date") or info.get("report_date") or info.get("date", "?"),
+            "description": info.get("description", ""),
+            "accession_number": info.get("accession_number"),
+        }
+        if info.get("transaction_type"):
+            entry["transaction_type"] = info["transaction_type"]
+        if info.get("shares_transacted"):
+            entry["shares_transacted"] = info["shares_transacted"]
+        filings.append(entry)
     filings.sort(key=lambda f: f.get("date", ""), reverse=True)
     return filings
 
 
 def _extract_events(values: list[dict]) -> list[dict]:
+    category_pid = _name_to_pid.get("category")
+    event_pid = _name_to_pid.get("form_8k_event")
+    event_status_pid = _name_to_pid.get("event_status")
+    event_item_pid = _name_to_pid.get("form_8k_item_code")
+    likelihood_pid = _name_to_pid.get("likelihood")
+    description_pid = _name_to_pid.get("description")
+    date_pid = _name_to_pid.get("date")
+    alias_pid = _name_to_pid.get("alias")
+
     by_entity: dict[str, dict] = {}
     for v in values:
         eid = v.get("eid", "")
         if eid not in by_entity:
             by_entity[eid] = {"neid": eid}
         val = v.get("value")
-        name = str(v.get("name", "")).lower() if v.get("name") else ""
         pid = v.get("pid")
-        if pid == 8:
+        if pid == alias_pid and val:
+            by_entity[eid].setdefault("description", val)
+        elif pid == description_pid and val:
             by_entity[eid]["description"] = val
-        elif "category" in name or "event_category" in name:
+        elif pid == category_pid and val:
             by_entity[eid]["category"] = val
-        elif "date" in name or "event_date" in name:
-            by_entity[eid]["date"] = val
-        elif "likelihood" in name:
+        elif pid == event_pid and val:
+            by_entity[eid]["event_type"] = val
+        elif pid == event_status_pid and val:
+            by_entity[eid]["status"] = val
+        elif pid == event_item_pid and val:
+            by_entity[eid]["item_code"] = val
+        elif pid == likelihood_pid and val:
             by_entity[eid]["likelihood"] = val
+        elif pid == date_pid and val:
+            by_entity[eid]["date"] = str(val)[:10]
+
+        if not by_entity[eid].get("date"):
+            recorded = v.get("recorded_at", "")
+            if recorded:
+                by_entity[eid]["date"] = recorded[:10]
 
     events = []
     for _eid, info in by_entity.items():
-        if info.get("category") or info.get("description"):
+        if info.get("category") or info.get("description") or info.get("event_type"):
             events.append(info)
     events.sort(key=lambda e: e.get("date", ""), reverse=True)
     return events
