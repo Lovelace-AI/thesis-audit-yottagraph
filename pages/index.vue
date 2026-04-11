@@ -10,31 +10,44 @@
                 <ThesisInput v-model="inputText" @submit="handleSubmit" />
             </div>
 
-            <!-- Clarifying: agent is parsing thesis -->
-            <div v-else-if="status === 'clarifying'">
+            <!-- Parsing / Resolving: agent is extracting entities -->
+            <div v-else-if="status === 'parsing' || status === 'resolving'">
                 <ThesisBar :thesis="thesis" />
                 <div class="content-area">
-                    <ResearchProgress :steps="progress" />
+                    <div class="d-flex flex-column align-center pa-8">
+                        <v-progress-circular indeterminate size="40" class="mb-4" />
+                        <span class="status-text">
+                            {{
+                                status === 'parsing'
+                                    ? 'Analyzing your thesis...'
+                                    : 'Resolving entities...'
+                            }}
+                        </span>
+                    </div>
                 </div>
             </div>
 
             <!-- Awaiting Confirmation: show entity resolution -->
-            <div v-else-if="status === 'awaiting_confirmation' && clarification">
+            <div v-else-if="status === 'awaiting_confirmation' && queryRewrite">
                 <ThesisBar :thesis="thesis" @edit="handleEdit" />
                 <div class="content-area">
                     <EntityClarification
-                        :clarification="clarification"
+                        :query-rewrite="queryRewrite"
                         @confirm="handleConfirm"
                         @edit="handleEdit"
                     />
                 </div>
             </div>
 
-            <!-- Researching: show progress -->
-            <div v-else-if="status === 'researching'">
+            <!-- Researching / Reporting: show progress -->
+            <div v-else-if="status === 'researching' || status === 'reporting'">
                 <ThesisBar :thesis="thesis" />
                 <div class="content-area">
                     <ResearchProgress :steps="progress" />
+                    <div v-if="status === 'reporting'" class="d-flex flex-column align-center pa-4">
+                        <v-progress-circular indeterminate size="32" class="mb-3" />
+                        <span class="status-text">Generating analysis report...</span>
+                    </div>
                 </div>
             </div>
 
@@ -43,8 +56,8 @@
                 <ThesisBar :thesis="thesis" show-actions @edit="handleEdit" @reset="handleReset" />
                 <div class="content-area">
                     <ResearchResults
-                        v-if="results"
-                        :results="results"
+                        v-if="report"
+                        :report="report"
                         :steps="progress"
                         @edit="handleEdit"
                         @reset="handleReset"
@@ -89,9 +102,9 @@
     const {
         thesis,
         status,
-        clarification,
+        queryRewrite,
         progress,
-        results,
+        report,
         rawFallback,
         error,
         submitThesis,
@@ -143,7 +156,6 @@
 <script lang="ts">
     /**
      * Inline sub-component: thesis display bar shown in non-idle states.
-     * Kept here because it's only used by this page.
      */
     export const ThesisBar = defineComponent({
         name: 'ThesisBar',
@@ -191,6 +203,13 @@
         max-width: 960px;
         margin: 0 auto;
         padding-top: 16px;
+    }
+
+    .status-text {
+        font-family: var(--font-mono);
+        font-size: 0.8rem;
+        color: var(--lv-silver);
+        letter-spacing: 0.03em;
     }
 
     .thesis-bar {

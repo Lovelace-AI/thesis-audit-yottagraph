@@ -1,57 +1,58 @@
 import { ref, computed } from 'vue';
 import { readSSE, extractAgentText } from './useAgentChat';
 import { useUserState } from './useUserState';
+import { searchEntities } from '~/utils/elementalHelpers';
 
 // ---------------------------------------------------------------------------
-// Types
+// Types — QueryRewrite document (the living JSON across rounds)
 // ---------------------------------------------------------------------------
 
 export interface EntityCandidate {
-    resolved_name: string;
+    name: string;
     neid: string;
-    entity_type: string;
-    description: string;
-    score: number;
+    type?: string;
+    score?: number;
 }
 
-export interface ClarificationEntity {
+export interface QueryEntity {
     mentioned_as: string;
-    candidates: EntityCandidate[];
-    selected_index: number | null;
-    needs_clarification?: string;
-}
-
-export interface ClarificationResponse {
-    type: 'clarification';
-    thesis_parsed: string;
-    entities: ClarificationEntity[];
-    claims: string[];
-}
-
-export interface EvidenceItem {
-    source: 'news' | 'filing' | 'stock' | 'event' | 'relationship' | 'macro';
-    title: string;
-    detail: string;
-    date?: string;
-    entity?: string;
+    status: 'pending' | 'resolved' | 'unresolved';
+    candidates?: EntityCandidate[];
+    name?: string;
     neid?: string;
-    source_url?: string;
-    tool_used?: string;
+    type?: string;
+    user_correction?: string;
 }
 
-export interface SignalGroup {
-    evidence: EvidenceItem[];
-    analysis: string;
+export interface MacroIndicator {
+    type: 'macro';
+    search_query: string;
 }
 
-export interface ThesisResults {
-    type: 'results';
-    thesis_parsed: string;
-    entities_examined: string[];
-    supporting: SignalGroup;
-    contradicting: SignalGroup;
-    limitations?: string;
+export interface QueryRewrite {
+    thesis_plaintext: string;
+    entities: QueryEntity[];
+    macro_indicators: MacroIndicator[];
+    claims: string[];
+    data_needs: string[];
 }
+
+// ---------------------------------------------------------------------------
+// Types — Report (final output)
+// ---------------------------------------------------------------------------
+
+export interface ReportResult {
+    query: QueryRewrite;
+    entity_data: Record<string, any>;
+    macro_data: Record<string, any>;
+    supporting_argument: string;
+    contradicting_argument: string;
+    final_analysis: string;
+}
+
+// ---------------------------------------------------------------------------
+// Types — Research progress tracking
+// ---------------------------------------------------------------------------
 
 export interface ResearchStep {
     id: string;
@@ -70,9 +71,11 @@ export interface EntitySelection {
 
 export type ResearchStatus =
     | 'idle'
-    | 'clarifying'
+    | 'parsing'
+    | 'resolving'
     | 'awaiting_confirmation'
     | 'researching'
+    | 'reporting'
     | 'done'
     | 'error';
 
@@ -81,14 +84,14 @@ export type ResearchStatus =
 // ---------------------------------------------------------------------------
 
 const TOOL_LABELS: Record<string, (args: Record<string, any>) => string> = {
-    lookup_entity: (a) => `Looking up "${a.name || '?'}"...`,
-    get_entity_news: (a) => `Fetching news for ${a.entity_name || '?'}...`,
+    get_news: (a) => `Fetching news for ${a.entity_name || '?'}...`,
     get_stock_prices: (a) => `Getting stock data for ${a.entity_name || '?'}...`,
-    get_entity_filings: (a) => `Searching filings for ${a.entity_name || '?'}...`,
-    get_entity_relationships: (a) => `Exploring relationships for ${a.entity_name || '?'}...`,
-    get_entity_events: (a) => `Finding events for ${a.entity_name || '?'}...`,
-    get_macro_data: (a) => `Searching macro data: "${a.query || '?'}"...`,
-    get_schema: () => 'Discovering available data types...',
+    get_filings: (a) => `Searching filings for ${a.entity_name || '?'}...`,
+    get_events: (a) => `Finding events for ${a.entity_name || '?'}...`,
+    get_relationships: (a) => `Exploring relationships for ${a.entity_name || '?'}...`,
+    get_macro: (a) => `Searching macro data: "${a.query || '?'}"...`,
+    get_entity_properties: (a) => `Getting properties for ${a.entity_name || '?'}...`,
+    finalize_research: () => 'Finalizing research data...',
 };
 
 function toolLabel(name: string, args: Record<string, any>): string {
@@ -105,12 +108,25 @@ export function useThesisResearch() {
 
     const thesis = ref('');
     const status = ref<ResearchStatus>('idle');
-    const clarification = ref<ClarificationResponse | null>(null);
+    const queryRewrite = ref<QueryRewrite | null>(null);
     const progress = ref<ResearchStep[]>([]);
-    const results = ref<ThesisResults | null>(null);
+    const report = ref<ReportResult | null>(null);
     const rawFallback = ref<string | null>(null);
-    const sessionId = ref<string | null>(null);
     const error = ref<string | null>(null);
+
+    // Per-agent session IDs (separate ADK deployments)
+    const sessionIds = ref<{
+        queryRewrite: string | null;
+        researcher: string | null;
+        report: string | null;
+    }>({ queryRewrite: null, researcher: null, report: null });
+
+    // Agent engine IDs (resolved once from gateway config)
+    const agentIds = ref<{
+        queryRewrite: string | null;
+        researcher: string | null;
+        report: string | null;
+    }>({ queryRewrite: null, researcher: null, report: null });
 
     function getGatewayUrl(): string {
         const cfg = useRuntimeConfig();
@@ -123,53 +139,64 @@ export function useThesisResearch() {
     }
 
     // -----------------------------------------------------------------------
-    // Agent discovery
+    // Agent discovery — resolve agent engine IDs from gateway config
     // -----------------------------------------------------------------------
 
-    const agentEngineId = ref<string | null>(null);
-
-    async function resolveAgent(): Promise<string | null> {
-        if (agentEngineId.value) return agentEngineId.value;
+    async function resolveAgents(): Promise<void> {
+        if (agentIds.value.queryRewrite) return;
 
         const gatewayUrl = getGatewayUrl();
         const orgId = getTenantOrgId();
-        if (!gatewayUrl || !orgId) return null;
+        if (!gatewayUrl || !orgId) return;
 
         try {
             const cfg = await $fetch<any>(`${gatewayUrl}/api/config/${orgId}`);
             const agents: any[] = cfg?.agents ?? [];
-            const match = agents.find(
-                (a: any) => a.name === 'thesis_researcher' || a.display_name === 'thesis_researcher'
-            );
-            if (match?.engine_id) {
-                agentEngineId.value = match.engine_id;
-                return match.engine_id;
+
+            for (const a of agents) {
+                const name = a.name || a.display_name || '';
+                if (name === 'query_rewrite') agentIds.value.queryRewrite = a.engine_id;
+                else if (name === 'researcher') agentIds.value.researcher = a.engine_id;
+                else if (name === 'report') agentIds.value.report = a.engine_id;
             }
-            if (agents.length > 0) {
-                agentEngineId.value = agents[0].engine_id;
-                return agents[0].engine_id;
+
+            // Fallback: if the old single agent is deployed, use it for all
+            if (!agentIds.value.queryRewrite && !agentIds.value.researcher) {
+                const legacy = agents.find(
+                    (a: any) =>
+                        a.name === 'thesis_researcher' || a.display_name === 'thesis_researcher'
+                );
+                if (legacy?.engine_id) {
+                    agentIds.value.queryRewrite = legacy.engine_id;
+                    agentIds.value.researcher = legacy.engine_id;
+                    agentIds.value.report = legacy.engine_id;
+                }
             }
         } catch {
-            // Agent not deployed yet
+            // Gateway not available
         }
-        return null;
     }
 
     // -----------------------------------------------------------------------
-    // Stream a message to the agent and process events
+    // Send a message to a specific agent
     // -----------------------------------------------------------------------
 
-    async function sendToAgent(message: string): Promise<string> {
+    async function sendToAgent(
+        agentKey: 'queryRewrite' | 'researcher' | 'report',
+        message: string,
+        opts?: { trackProgress?: boolean }
+    ): Promise<{ text: string; finalizeData?: string }> {
         const gatewayUrl = getGatewayUrl();
         const orgId = getTenantOrgId();
-        const engineId = await resolveAgent();
+        await resolveAgents();
 
+        const engineId = agentIds.value[agentKey];
         if (!gatewayUrl || !orgId) {
             throw new Error('Gateway URL or tenant org ID not configured.');
         }
         if (!engineId) {
             throw new Error(
-                'No thesis_researcher agent deployed yet. Deploy the agent first using /deploy_agent.'
+                `No ${agentKey} agent deployed. Deploy agents first using /deploy_agent.`
             );
         }
 
@@ -178,13 +205,13 @@ export function useThesisResearch() {
             headers['Authorization'] = `Bearer ${accessToken.value}`;
         }
         const body: any = { message };
-        if (sessionId.value) {
-            body.session_id = sessionId.value;
+        if (sessionIds.value[agentKey]) {
+            body.session_id = sessionIds.value[agentKey];
         }
 
         let finalText = '';
+        let finalizeData: string | undefined;
 
-        const localUrl = `/api/agent/${engineId}/stream`;
         const portalStreamUrl = `${gatewayUrl}/api/agents/${orgId}/${engineId}/stream`;
         const portalQueryUrl = `${gatewayUrl}/api/agents/${orgId}/${engineId}/query`;
 
@@ -194,32 +221,42 @@ export function useThesisResearch() {
             for await (const { event, data } of readSSE(response)) {
                 if (event === 'function_call') {
                     lastCallName = data.name || '?';
-                    const step: ResearchStep = {
-                        id: crypto.randomUUID(),
-                        tool: lastCallName,
-                        args: data.args || {},
-                        label: toolLabel(lastCallName, data.args || {}),
-                        timestamp: Date.now(),
-                    };
-                    progress.value = [...progress.value, step];
+                    if (opts?.trackProgress) {
+                        const step: ResearchStep = {
+                            id: crypto.randomUUID(),
+                            tool: lastCallName,
+                            args: data.args || {},
+                            label: toolLabel(lastCallName, data.args || {}),
+                            timestamp: Date.now(),
+                        };
+                        progress.value = [...progress.value, step];
+                    }
                 } else if (event === 'function_response') {
                     const respName = data.name || lastCallName;
                     const respText =
                         typeof data.response === 'string'
                             ? data.response
                             : JSON.stringify(data.response, null, 2);
-                    const steps = progress.value;
-                    for (let i = steps.length - 1; i >= 0; i--) {
-                        if (steps[i].tool === respName && !steps[i].response) {
-                            steps[i] = { ...steps[i], response: respText };
-                            progress.value = [...steps];
-                            break;
+
+                    // Capture finalize_research response — this is the full accumulated JSON
+                    if (respName === 'finalize_research') {
+                        finalizeData = respText;
+                    }
+
+                    if (opts?.trackProgress) {
+                        const steps = progress.value;
+                        for (let i = steps.length - 1; i >= 0; i--) {
+                            if (steps[i].tool === respName && !steps[i].response) {
+                                steps[i] = { ...steps[i], response: respText };
+                                progress.value = [...steps];
+                                break;
+                            }
                         }
                     }
                 } else if (event === 'text') {
                     text = data.text || text;
                 } else if (event === 'done') {
-                    if (data.session_id) sessionId.value = data.session_id;
+                    if (data.session_id) sessionIds.value[agentKey] = data.session_id;
                     if (data.text) text = data.text;
                     break;
                 } else if (event === 'error') {
@@ -229,23 +266,7 @@ export function useThesisResearch() {
             return text;
         };
 
-        // Try local server route first (single hop to Agent Engine)
-        try {
-            const localResp = await fetch(localUrl, {
-                method: 'POST',
-                headers,
-                body: JSON.stringify(body),
-            });
-            if (localResp.ok && localResp.body) {
-                const result = await processSSE(localResp);
-                if (result !== null) return result;
-            }
-        } catch {
-            // Local route unavailable
-        }
-
-        // Fall back to portal streaming proxy (handles its own auth)
-        progress.value = [];
+        // Try portal streaming proxy
         try {
             const portalResp = await fetch(portalStreamUrl, {
                 method: 'POST',
@@ -254,24 +275,24 @@ export function useThesisResearch() {
             });
             if (portalResp.ok && portalResp.body) {
                 const result = await processSSE(portalResp);
-                if (result !== null) return result;
+                if (result !== null) return { text: result, finalizeData };
             }
         } catch {
             // Portal stream unavailable
         }
 
-        // Last resort: buffered /query endpoint
+        // Fall back to buffered /query endpoint
         const queryResp = await $fetch<{ output: any; session_id: string | null }>(portalQueryUrl, {
             method: 'POST',
             headers,
             body,
         });
-        if (queryResp.session_id) sessionId.value = queryResp.session_id;
-        return extractAgentText(queryResp.output);
+        if (queryResp.session_id) sessionIds.value[agentKey] = queryResp.session_id;
+        return { text: extractAgentText(queryResp.output) };
     }
 
     // -----------------------------------------------------------------------
-    // Parse structured JSON from agent response
+    // JSON parsing utilities
     // -----------------------------------------------------------------------
 
     function stripTrailingCommas(json: string): string {
@@ -290,99 +311,271 @@ export function useThesisResearch() {
         }
     }
 
-    function parseAgentResponse(text: string): ClarificationResponse | ThesisResults | null {
+    function extractJSON(text: string): any | null {
         const jsonMatch = text.match(/```json\s*([\s\S]*?)```/);
         const toParse = jsonMatch ? jsonMatch[1].trim() : text.trim();
-
         const parsed = tryParseJSON(toParse);
-        if (parsed?.type === 'clarification' || parsed?.type === 'results') {
-            return parsed;
-        }
+        if (parsed) return parsed;
 
-        const braceMatch = text.match(/\{[\s\S]*"type"\s*:\s*"(clarification|results)"[\s\S]*\}/);
+        // Try extracting a JSON object from within the text
+        const braceMatch = text.match(/\{[\s\S]*\}/);
         if (braceMatch) {
-            const fallback = tryParseJSON(braceMatch[0]);
-            if (fallback) return fallback;
+            return tryParseJSON(braceMatch[0]);
         }
         return null;
     }
 
     // -----------------------------------------------------------------------
-    // Public methods
+    // Stage 1: Query Rewrite Loop
     // -----------------------------------------------------------------------
+
+    async function runQueryRewrite(qr: QueryRewrite): Promise<any> {
+        const message = JSON.stringify(qr);
+        const { text } = await sendToAgent('queryRewrite', message);
+        return extractJSON(text);
+    }
+
+    async function resolveEntities(
+        candidates: string[]
+    ): Promise<Array<{ mentioned_as: string; candidates: EntityCandidate[] }>> {
+        const results = await Promise.all(
+            candidates.map(async (name) => {
+                try {
+                    const matches = await searchEntities(name, { maxResults: 5 });
+                    return {
+                        mentioned_as: name,
+                        candidates: matches.map((m) => ({
+                            name: m.name,
+                            neid: m.neid,
+                            type: m.type,
+                            score: m.score,
+                        })),
+                    };
+                } catch {
+                    return { mentioned_as: name, candidates: [] };
+                }
+            })
+        );
+        return results;
+    }
 
     async function submitThesis(thesisText: string): Promise<void> {
         thesis.value = thesisText;
-        status.value = 'clarifying';
-        clarification.value = null;
-        results.value = null;
+        status.value = 'parsing';
+        queryRewrite.value = null;
+        report.value = null;
         rawFallback.value = null;
         progress.value = [];
         error.value = null;
-        sessionId.value = null;
+        sessionIds.value = { queryRewrite: null, researcher: null, report: null };
 
         try {
-            const responseText = await sendToAgent(thesisText);
-            const parsed = parseAgentResponse(responseText);
+            // Build initial QueryRewrite
+            const qr: QueryRewrite = {
+                thesis_plaintext: thesisText,
+                entities: [],
+                macro_indicators: [],
+                claims: [],
+                data_needs: [],
+            };
 
-            if (parsed?.type === 'clarification') {
-                clarification.value = parsed as ClarificationResponse;
-                status.value = 'awaiting_confirmation';
-            } else if (parsed?.type === 'results') {
-                results.value = parsed as ThesisResults;
-                status.value = 'done';
-            } else {
-                rawFallback.value = responseText;
-                status.value = 'done';
+            // Ask the Query Rewrite Agent to extract entities
+            const agentResponse = await runQueryRewrite(qr);
+            if (!agentResponse) {
+                throw new Error('Query Rewrite Agent returned unparseable response.');
             }
+
+            // Update the QueryRewrite with agent's output
+            qr.claims = agentResponse.claims || [];
+            qr.data_needs = agentResponse.data_needs || [];
+            qr.macro_indicators = agentResponse.macro_indicators || [];
+
+            // Resolve candidate entities
+            const candidateNames: string[] = agentResponse.candidate_entities || [];
+            if (candidateNames.length > 0) {
+                status.value = 'resolving';
+                const resolved = await resolveEntities(candidateNames);
+
+                qr.entities = resolved.map((r) => ({
+                    mentioned_as: r.mentioned_as,
+                    status: 'pending' as const,
+                    candidates: r.candidates,
+                }));
+            }
+
+            queryRewrite.value = qr;
+            status.value = 'awaiting_confirmation';
         } catch (e: any) {
-            error.value = e.message || 'Failed to analyze thesis.';
+            error.value = e.message || 'Failed to parse thesis.';
             status.value = 'error';
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Stage 1 continued: User confirms or corrects entities
+    // -----------------------------------------------------------------------
+
     async function confirmEntities(selections: EntitySelection[]): Promise<void> {
-        const hasFreeText = selections.some((s) => s.freeText);
+        if (!queryRewrite.value) return;
 
-        let message: string;
-        if (hasFreeText) {
-            const corrections = selections
-                .filter((s) => s.freeText)
-                .map((s) => `For "${s.mentioned_as}": ${s.freeText}`)
-                .join('\n');
-            const confirmed = selections
-                .filter((s) => s.neid)
-                .map((s) => `For "${s.mentioned_as}": confirmed NEID ${s.neid}`)
-                .join('\n');
-            message = `Entity corrections:\n${corrections}\n${confirmed}\n\nPlease re-resolve the corrected entities and return an updated clarification.`;
+        const qr = { ...queryRewrite.value };
+        const unresolvedRemain: string[] = [];
+
+        // Apply user selections to the QueryRewrite
+        qr.entities = qr.entities.map((entity, idx) => {
+            const sel = selections[idx];
+            if (!sel) return entity;
+
+            if (sel.neid) {
+                // User confirmed a candidate
+                const candidate = entity.candidates?.find((c) => c.neid === sel.neid);
+                return {
+                    mentioned_as: entity.mentioned_as,
+                    status: 'resolved' as const,
+                    name: candidate?.name || entity.mentioned_as,
+                    neid: sel.neid,
+                    type: candidate?.type,
+                };
+            } else if (sel.freeText) {
+                // User provided a correction — mark as unresolved
+                unresolvedRemain.push(entity.mentioned_as);
+                return {
+                    mentioned_as: entity.mentioned_as,
+                    status: 'unresolved' as const,
+                    user_correction: sel.freeText,
+                };
+            }
+            return entity;
+        });
+
+        queryRewrite.value = qr;
+
+        if (unresolvedRemain.length > 0) {
+            // Another round: send back to Query Rewrite Agent
+            status.value = 'parsing';
+            error.value = null;
+
+            try {
+                const agentResponse = await runQueryRewrite(qr);
+                if (!agentResponse) {
+                    throw new Error('Query Rewrite Agent returned unparseable response.');
+                }
+
+                // Update claims/data_needs if agent refined them
+                if (agentResponse.claims?.length) qr.claims = agentResponse.claims;
+                if (agentResponse.data_needs?.length) qr.data_needs = agentResponse.data_needs;
+
+                // Resolve new candidates for unresolved entities
+                const newCandidates: string[] = agentResponse.candidate_entities || [];
+                if (newCandidates.length > 0) {
+                    status.value = 'resolving';
+                    const resolved = await resolveEntities(newCandidates);
+
+                    // Match resolved entities back to unresolved ones
+                    for (const entity of qr.entities) {
+                        if (entity.status !== 'unresolved') continue;
+                        const match = resolved.find(
+                            (r) =>
+                                r.mentioned_as.toLowerCase() ===
+                                    entity.user_correction?.toLowerCase() ||
+                                r.candidates.some(
+                                    (c) =>
+                                        c.name.toLowerCase() ===
+                                        entity.user_correction?.toLowerCase()
+                                )
+                        );
+                        if (match || resolved.length > 0) {
+                            const entityMatch = match || resolved.shift()!;
+                            entity.status = 'pending';
+                            entity.candidates = entityMatch.candidates;
+                            delete entity.user_correction;
+                        }
+                    }
+                }
+
+                queryRewrite.value = { ...qr };
+                status.value = 'awaiting_confirmation';
+            } catch (e: any) {
+                error.value = e.message || 'Failed to re-resolve entities.';
+                status.value = 'error';
+            }
         } else {
-            const confirmLines = selections
-                .map((s) => `"${s.mentioned_as}": NEID ${s.neid}`)
-                .join('\n');
-            message = `Entities confirmed:\n${confirmLines}\n\nProceed with full research.`;
+            // All resolved — proceed to research
+            await runResearchAndReport(qr);
         }
+    }
 
+    // -----------------------------------------------------------------------
+    // Stage 2 + 3: Research then Report
+    // -----------------------------------------------------------------------
+
+    async function runResearchAndReport(qr: QueryRewrite): Promise<void> {
+        status.value = 'researching';
         progress.value = [];
-
-        if (hasFreeText) {
-            status.value = 'clarifying';
-        } else {
-            status.value = 'researching';
-        }
         error.value = null;
 
         try {
-            const responseText = await sendToAgent(message);
-            const parsed = parseAgentResponse(responseText);
+            // Build the research input — only resolved entities
+            const researchInput = {
+                thesis_plaintext: qr.thesis_plaintext,
+                entities: qr.entities
+                    .filter((e) => e.status === 'resolved')
+                    .map((e) => ({
+                        name: e.name || e.mentioned_as,
+                        neid: e.neid,
+                        type: e.type,
+                    })),
+                macro_indicators: qr.macro_indicators,
+                claims: qr.claims,
+                data_needs: qr.data_needs,
+            };
 
-            if (parsed?.type === 'clarification') {
-                clarification.value = parsed as ClarificationResponse;
-                status.value = 'awaiting_confirmation';
-            } else if (parsed?.type === 'results') {
-                results.value = parsed as ThesisResults;
+            // Send to Research Agent
+            const { finalizeData } = await sendToAgent(
+                'researcher',
+                JSON.stringify(researchInput),
+                { trackProgress: true }
+            );
+
+            // Parse the accumulated research JSON from finalize_research()
+            let researchData: any = null;
+            if (finalizeData) {
+                researchData = tryParseJSON(finalizeData);
+            }
+
+            if (!researchData) {
+                throw new Error(
+                    'Research Agent did not return accumulated data. ' +
+                        'The finalize_research() tool may not have been called.'
+                );
+            }
+
+            // Stage 3: Report
+            status.value = 'reporting';
+
+            const reportInput = {
+                query: qr,
+                ...researchData,
+            };
+
+            const { text: reportText } = await sendToAgent('report', JSON.stringify(reportInput));
+
+            const reportParsed = extractJSON(reportText);
+            if (
+                reportParsed &&
+                (reportParsed.supporting_argument || reportParsed.contradicting_argument)
+            ) {
+                report.value = {
+                    query: qr,
+                    entity_data: researchData.entity_data || {},
+                    macro_data: researchData.macro_data || {},
+                    supporting_argument: reportParsed.supporting_argument || '',
+                    contradicting_argument: reportParsed.contradicting_argument || '',
+                    final_analysis: reportParsed.final_analysis || '',
+                };
                 status.value = 'done';
             } else {
-                rawFallback.value = responseText;
+                rawFallback.value = reportText;
                 status.value = 'done';
             }
         } catch (e: any) {
@@ -391,24 +584,28 @@ export function useThesisResearch() {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Reset
+    // -----------------------------------------------------------------------
+
     function reset(): void {
         thesis.value = '';
         status.value = 'idle';
-        clarification.value = null;
+        queryRewrite.value = null;
         progress.value = [];
-        results.value = null;
+        report.value = null;
         rawFallback.value = null;
-        sessionId.value = null;
         error.value = null;
-        agentEngineId.value = null;
+        sessionIds.value = { queryRewrite: null, researcher: null, report: null };
+        agentIds.value = { queryRewrite: null, researcher: null, report: null };
     }
 
     return {
         thesis: computed(() => thesis.value),
         status: computed(() => status.value),
-        clarification: computed(() => clarification.value),
+        queryRewrite: computed(() => queryRewrite.value),
         progress: computed(() => progress.value),
-        results: computed(() => results.value),
+        report: computed(() => report.value),
         rawFallback: computed(() => rawFallback.value),
         error: computed(() => error.value),
         submitThesis,

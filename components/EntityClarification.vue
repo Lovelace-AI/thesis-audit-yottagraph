@@ -8,14 +8,24 @@
             </p>
         </div>
 
-        <div v-if="clarification.thesis_parsed" class="parsed-thesis">
-            <span class="parsed-label">Interpreted as:</span>
-            <span class="parsed-text">{{ clarification.thesis_parsed }}</span>
+        <div v-if="queryRewrite.claims.length" class="parsed-thesis">
+            <span class="parsed-label">Claims to investigate:</span>
+            <div class="claims-list">
+                <v-chip
+                    v-for="claim in queryRewrite.claims"
+                    :key="claim"
+                    variant="tonal"
+                    color="info"
+                    size="small"
+                >
+                    {{ claim }}
+                </v-chip>
+            </div>
         </div>
 
         <div class="entity-cards">
             <v-card
-                v-for="(entity, idx) in clarification.entities"
+                v-for="(entity, idx) in pendingEntities"
                 :key="idx"
                 class="entity-card"
                 variant="outlined"
@@ -26,7 +36,7 @@
                 </v-card-title>
 
                 <v-card-text>
-                    <template v-if="entity.candidates.length > 0">
+                    <template v-if="entity.candidates && entity.candidates.length > 0">
                         <v-radio-group
                             v-model="selections[idx].choice"
                             density="compact"
@@ -41,22 +51,18 @@
                                 <template #label>
                                     <div class="candidate-info">
                                         <div class="candidate-main">
-                                            <span class="candidate-name">{{
-                                                candidate.resolved_name
-                                            }}</span>
+                                            <span class="candidate-name">{{ candidate.name }}</span>
                                             <v-chip
+                                                v-if="candidate.type"
                                                 size="x-small"
                                                 variant="tonal"
-                                                :color="typeColor(candidate.entity_type)"
+                                                :color="typeColor(candidate.type)"
                                             >
-                                                {{ candidate.entity_type }}
+                                                {{ candidate.type }}
                                             </v-chip>
-                                            <span class="candidate-score">
+                                            <span v-if="candidate.score" class="candidate-score">
                                                 {{ Math.round(candidate.score * 100) }}%
                                             </span>
-                                        </div>
-                                        <div v-if="candidate.description" class="candidate-desc">
-                                            {{ candidate.description }}
                                         </div>
                                     </div>
                                 </template>
@@ -82,7 +88,7 @@
 
                     <template v-else>
                         <v-alert type="warning" variant="tonal" density="compact" class="mb-3">
-                            {{ entity.needs_clarification || 'Could not resolve this entity.' }}
+                            Could not resolve this entity. Please specify what you mean.
                         </v-alert>
                         <v-text-field
                             v-model="selections[idx].freeText"
@@ -96,17 +102,32 @@
             </v-card>
         </div>
 
-        <div v-if="clarification.claims.length" class="claims-section">
-            <span class="claims-label">Testable claims identified:</span>
-            <div class="claims-list">
+        <div v-if="resolvedEntities.length" class="resolved-section">
+            <span class="resolved-label">Already confirmed:</span>
+            <div class="resolved-chips">
                 <v-chip
-                    v-for="claim in clarification.claims"
-                    :key="claim"
-                    variant="tonal"
-                    color="info"
+                    v-for="entity in resolvedEntities"
+                    :key="entity.neid"
                     size="small"
+                    variant="tonal"
+                    color="success"
                 >
-                    {{ claim }}
+                    <v-icon start size="x-small">mdi-check-circle</v-icon>
+                    {{ entity.name || entity.mentioned_as }}
+                </v-chip>
+            </div>
+        </div>
+
+        <div v-if="queryRewrite.data_needs.length" class="data-needs-section">
+            <span class="data-needs-label">Data to gather:</span>
+            <div class="data-needs-chips">
+                <v-chip
+                    v-for="need in queryRewrite.data_needs"
+                    :key="need"
+                    size="x-small"
+                    variant="outlined"
+                >
+                    {{ need }}
                 </v-chip>
             </div>
         </div>
@@ -121,10 +142,10 @@
 </template>
 
 <script setup lang="ts">
-    import type { ClarificationResponse, EntitySelection } from '~/composables/useThesisResearch';
+    import type { QueryRewrite, EntitySelection } from '~/composables/useThesisResearch';
 
     const props = defineProps<{
-        clarification: ClarificationResponse;
+        queryRewrite: QueryRewrite;
     }>();
 
     const emit = defineEmits<{
@@ -139,11 +160,20 @@
 
     const selections = ref<SelectionState[]>([]);
 
+    const pendingEntities = computed(() =>
+        props.queryRewrite.entities.filter((e) => e.status === 'pending')
+    );
+
+    const resolvedEntities = computed(() =>
+        props.queryRewrite.entities.filter((e) => e.status === 'resolved')
+    );
+
     watch(
-        () => props.clarification,
-        (c) => {
-            selections.value = c.entities.map((entity) => ({
-                choice: entity.candidates.length > 0 ? (entity.selected_index ?? 0) : 'other',
+        () => props.queryRewrite,
+        (qr) => {
+            const pending = qr.entities.filter((e) => e.status === 'pending');
+            selections.value = pending.map((entity) => ({
+                choice: entity.candidates && entity.candidates.length > 0 ? 0 : 'other',
                 freeText: '',
             }));
         },
@@ -151,10 +181,13 @@
     );
 
     const allResolved = computed(() => {
-        return selections.value.every((s, idx) => {
+        return pendingEntities.value.every((entity, idx) => {
+            const s = selections.value[idx];
+            if (!s) return false;
             if (s.choice === 'other') return s.freeText.trim().length > 0;
-            const entity = props.clarification.entities[idx];
-            return entity && entity.candidates.length > 0 && typeof s.choice === 'number';
+            return (
+                entity.candidates && entity.candidates.length > 0 && typeof s.choice === 'number'
+            );
         });
     });
 
@@ -163,28 +196,41 @@
             organization: 'primary',
             person: 'info',
             financial_instrument: 'success',
+            product: 'warning',
             location: 'warning',
         };
         return colors[entityType] || 'default';
     }
 
     function handleConfirm() {
-        const result: EntitySelection[] = props.clarification.entities.map((entity, idx) => {
-            const sel = selections.value[idx];
-            if (sel.choice === 'other') {
+        const allEntities = props.queryRewrite.entities;
+        let pendingIdx = 0;
+
+        const result: EntitySelection[] = allEntities.map((entity) => {
+            if (entity.status === 'resolved') {
+                return {
+                    mentioned_as: entity.mentioned_as,
+                    neid: entity.neid || null,
+                    freeText: null,
+                };
+            }
+
+            const sel = selections.value[pendingIdx++];
+            if (!sel || sel.choice === 'other') {
                 return {
                     mentioned_as: entity.mentioned_as,
                     neid: null,
-                    freeText: sel.freeText.trim(),
+                    freeText: sel?.freeText?.trim() || null,
                 };
             }
-            const candidate = entity.candidates[sel.choice as number];
+            const candidate = entity.candidates?.[sel.choice as number];
             return {
                 mentioned_as: entity.mentioned_as,
                 neid: candidate?.neid ?? null,
                 freeText: null,
             };
         });
+
         emit('confirm', result);
     }
 </script>
@@ -220,19 +266,24 @@
         margin-bottom: 20px;
     }
 
-    .parsed-label {
+    .parsed-label,
+    .resolved-label,
+    .data-needs-label {
         font-family: var(--font-mono);
         font-size: 0.7rem;
         text-transform: uppercase;
         letter-spacing: 0.05em;
         color: var(--lv-silver);
         display: block;
-        margin-bottom: 4px;
+        margin-bottom: 8px;
     }
 
-    .parsed-text {
-        font-size: 0.95rem;
-        line-height: 1.4;
+    .claims-list,
+    .resolved-chips,
+    .data-needs-chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
     }
 
     .entity-cards {
@@ -277,35 +328,14 @@
         color: var(--lv-silver);
     }
 
-    .candidate-desc {
-        font-size: 0.8rem;
-        color: var(--lv-silver);
-        padding-left: 2px;
-    }
-
     .other-label {
         color: var(--lv-silver);
         font-style: italic;
     }
 
-    .claims-section {
-        margin-bottom: 24px;
-    }
-
-    .claims-label {
-        font-family: var(--font-mono);
-        font-size: 0.7rem;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        color: var(--lv-silver);
-        display: block;
-        margin-bottom: 8px;
-    }
-
-    .claims-list {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
+    .resolved-section,
+    .data-needs-section {
+        margin-bottom: 20px;
     }
 
     .clarification-actions {

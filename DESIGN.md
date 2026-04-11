@@ -2,41 +2,67 @@
 
 ## Vision
 
-A user proposes a financial theory, and the app researches it against the Lovelace yottagraph. The response is organized into "supporting" and "contradicting" signals -- concrete evidence from the knowledge graph plus agent-synthesized analysis. The user isn't given a yes/no answer; rather a balanced collection of data and reasoning that helps them assess their original theory.
+A user proposes a financial theory, and the app researches it against the Lovelace yottagraph. The response is organized into "supporting" and "contradicting" arguments -- concrete evidence from the knowledge graph plus agent-synthesized analysis. The user isn't given a yes/no answer; rather a balanced collection of data and reasoning that helps them assess their original theory.
 
 Since this is based on the Lovelace KG, this is heavily financial services focused. A high-level summary: "applying the scientific method to understanding the FSI space".
 
 ## Status
 
-Initial implementation complete. The UI, composable, and ADK agent are built. The agent (`thesis_researcher`) needs to be deployed via `/deploy_agent` before the full workflow is functional.
+Multi-agent pipeline implemented. Three ADK agents (`query_rewrite`, `researcher`, `report`) need to be deployed via `/deploy_agent` before the full workflow is functional.
 
 ## Architecture
 
-Single-page Nuxt 3 SPA with a two-phase ADK agent workflow:
+Single-page Nuxt 3 SPA with a three-stage multi-agent pipeline:
 
-1. **Phase 1 (Clarification):** User submits thesis. Agent parses it, resolves entities against the yottagraph, and returns ranked candidates for user confirmation.
-2. **Phase 2 (Research):** After user confirms entities, agent gathers evidence (news, filings, stock data, events, relationships, macro data) and organizes findings into supporting vs contradicting signals.
+### Stage 1: Query Rewrite (iterative loop)
 
-Both phases use the same ADK session for continuity. The frontend streams SSE events for real-time progress display.
+1. User submits plaintext thesis.
+2. **Query Rewrite Agent** (ADK, no tools) extracts entity substrings, claims, and data needs.
+3. **Entity Resolution** (code) calls `searchEntities()` for each candidate, attaching ranked results with real NEIDs.
+4. **User Confirmation** — user picks from ranked candidates or provides free-text corrections.
+5. If any entities remain unresolved, the loop repeats: agent sees the corrections and produces new candidates.
+6. Once all entities are resolved, the finalized QueryRewrite JSON proceeds to Stage 2.
+
+The QueryRewrite is a living JSON document that accumulates state across rounds. The agent never sees or produces NEIDs — only text substrings.
+
+### Stage 2: Research
+
+**Research Agent** (ADK, with tools) decides what data to fetch based on the finalized QueryRewrite. Each Python tool calls the Elemental API directly, appends raw results to an in-memory accumulator, and returns a read-only summary to the agent. The agent iterates until satisfied, then calls `finalize_research()` which returns the full accumulated JSON via the SSE stream.
+
+### Stage 3: Report
+
+**Report Agent** (ADK, no tools) receives the complete research JSON (query + raw entity data + macro data). It produces three plaintext analysis fields: `supporting_argument`, `contradicting_argument`, and `final_analysis`. The raw data travels through to the UI alongside the analyses.
+
+### Design Principle
+
+**LLMs decide _what_ to do. Code decides _what the data is_.** No agent ever writes data into the result. Raw data is mechanically stored by code; agents can only observe summaries and request more.
 
 ## Modules
 
-### `agents/thesis_researcher/`
+### `agents/query_rewrite/`
 
-Python ADK agent deployed to Vertex AI Agent Engine. Contains eight tools for querying the Elemental API: `lookup_entity`, `get_entity_news`, `get_stock_prices`, `get_entity_filings`, `get_entity_relationships`, `get_entity_events`, `get_macro_data`, `get_schema`. All tools return formatted strings and handle errors gracefully.
+Python ADK agent (no tools). Takes a QueryRewrite JSON, returns candidate entity substrings, claims, and data needs. Supports multi-round sessions for the iterative entity resolution loop.
+
+### `agents/researcher/`
+
+Python ADK agent with research tools: `get_news`, `get_stock_prices`, `get_filings`, `get_events`, `get_relationships`, `get_macro`, `get_entity_properties`, `finalize_research`. Each tool calls the Elemental API via `broadchurch_auth.elemental_client`, accumulates raw results in Python memory, and returns summaries.
+
+### `agents/report/`
+
+Python ADK agent (no tools). Takes the full research JSON and produces three analysis fields. Pure reasoning — no data fabrication.
 
 ### `composables/useThesisResearch.ts`
 
-Vue composable managing the two-phase research flow. Handles agent discovery via tenant config, SSE streaming with progress tracking, structured JSON response parsing, and session continuity between phases. Exposes reactive state for thesis, status, clarification, progress, results, and error.
+Vue composable orchestrating the three-stage pipeline. Manages per-agent session IDs, agent discovery via tenant config, SSE streaming with progress tracking, entity resolution via `searchEntities()`, and JSON response parsing. Exposes reactive state for thesis, status, queryRewrite, progress, report, and error.
 
 ### `components/`
 
-- **ThesisInput** -- Thesis entry form with example chips and keyboard shortcut (Cmd/Ctrl+Enter).
-- **EntityClarification** -- Displays resolved entity candidates with ranked selection, free-text override via "Other...", and claims list.
+- **ThesisInput** -- Thesis entry form with example chips and keyboard shortcut.
+- **EntityClarification** -- Displays entity candidates from the QueryRewrite JSON. Shows resolved entities, pending candidates with ranked selection, free-text "Other..." option, claims, and data needs.
 - **ResearchProgress** -- Real-time research step timeline derived from agent `function_call` SSE events.
-- **ResearchResults** -- Two-column supporting/contradicting signal display with evidence cards and synthesis.
-- **SignalCard** -- Individual evidence card with source-type chip, entity, date, and detail.
+- **ResearchResults** -- Report display with supporting/contradicting argument cards, final analysis, expandable per-entity raw data sections, macro data, and "Show Your Work" tool call trail.
+- **EntityInfoCard** -- Raw entity data display triggered by clicking any NEID.
 
 ### `pages/index.vue`
 
-Single page orchestrating five visual states: idle (input), clarifying (agent parsing), awaiting confirmation (entity review), researching (progress), and done (results). Includes inline ThesisBar sub-component for thesis display across states.
+Single page orchestrating six visual states: idle (input), parsing (agent analyzing), resolving (entity search), awaiting confirmation (entity review), researching/reporting (progress), and done (report). Includes inline ThesisBar sub-component for thesis display across states.

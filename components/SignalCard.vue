@@ -53,7 +53,16 @@
 </template>
 
 <script setup lang="ts">
-    import type { EvidenceItem } from '~/composables/useThesisResearch';
+    interface EvidenceItem {
+        source: string;
+        title: string;
+        detail: string;
+        date?: string;
+        entity?: string;
+        neid?: string;
+        source_url?: string;
+        tool_used?: string;
+    }
 
     const props = defineProps<{
         evidence: EvidenceItem;

@@ -28,25 +28,25 @@
     }>();
 
     const TOOL_ICONS: Record<string, string> = {
-        lookup_entity: 'mdi-magnify',
-        get_entity_news: 'mdi-newspaper-variant-outline',
+        get_news: 'mdi-newspaper-variant-outline',
         get_stock_prices: 'mdi-chart-line',
-        get_entity_filings: 'mdi-file-document-outline',
-        get_entity_relationships: 'mdi-graph-outline',
-        get_entity_events: 'mdi-calendar-star',
-        get_macro_data: 'mdi-trending-up',
-        get_schema: 'mdi-database-search-outline',
+        get_filings: 'mdi-file-document-outline',
+        get_relationships: 'mdi-graph-outline',
+        get_events: 'mdi-calendar-star',
+        get_macro: 'mdi-trending-up',
+        get_entity_properties: 'mdi-database-search-outline',
+        finalize_research: 'mdi-check-circle-outline',
     };
 
     const TOOL_COLORS: Record<string, string> = {
-        lookup_entity: 'primary',
-        get_entity_news: 'info',
+        get_news: 'info',
         get_stock_prices: 'success',
-        get_entity_filings: 'warning',
-        get_entity_relationships: 'primary',
-        get_entity_events: 'warning',
-        get_macro_data: 'info',
-        get_schema: 'default',
+        get_filings: 'warning',
+        get_relationships: 'primary',
+        get_events: 'warning',
+        get_macro: 'info',
+        get_entity_properties: 'default',
+        finalize_research: 'success',
     };
 
     function toolIcon(tool: string): string {

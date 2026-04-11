@@ -59,7 +59,7 @@ export function padNeid(value: string | number): string {
 export async function searchEntities(
     query: string,
     options?: { maxResults?: number; flavors?: string[]; includeNames?: boolean }
-): Promise<{ neid: string; name: string; score?: number }[]> {
+): Promise<{ neid: string; name: string; type?: string; score?: number }[]> {
     const url = buildGatewayUrl('entities/search');
     const res = await $fetch<any>(url, {
         method: 'POST',
@@ -69,12 +69,16 @@ export async function searchEntities(
             maxResults: options?.maxResults ?? 10,
             flavors: options?.flavors,
             includeNames: options?.includeNames ?? true,
+            includeFlavors: true,
+            includeScores: true,
+            minScore: 0.3,
         },
     });
     const matches: any[] = res?.results?.[0]?.matches ?? [];
     return matches.map((m) => ({
         neid: m.neid,
         name: m.name || m.neid,
+        type: m.flavor,
         score: m.score,
     }));
 }

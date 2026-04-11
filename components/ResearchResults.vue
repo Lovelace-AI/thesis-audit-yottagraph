@@ -1,106 +1,145 @@
 <template>
     <div class="research-results">
         <div class="results-header">
-            <h2 class="section-title">Research Results</h2>
-            <div v-if="results.entities_examined.length" class="entities-examined">
+            <h2 class="section-title">Research Report</h2>
+            <div v-if="entityNames.length" class="entities-examined">
                 <span class="entities-label">Entities examined:</span>
                 <v-chip
-                    v-for="entity in results.entities_examined"
-                    :key="entity"
+                    v-for="entity in entityNames"
+                    :key="entity.name"
                     size="small"
                     variant="tonal"
+                    :class="{ 'entity-link': !!entity.neid }"
+                    @click="entity.neid && $emit('inspect', entity.neid)"
                 >
-                    {{ entity }}
+                    {{ entity.name }}
                 </v-chip>
             </div>
         </div>
 
+        <!-- Analysis columns -->
         <v-row>
             <v-col cols="12" md="6">
-                <div class="signal-column supporting">
-                    <div class="column-header">
-                        <v-icon color="success" class="mr-2">mdi-thumb-up-outline</v-icon>
-                        <span class="column-title">Supporting Signals</span>
-                        <v-chip size="x-small" color="success" variant="tonal">
-                            {{ results.supporting.evidence.length }}
-                        </v-chip>
-                    </div>
-
-                    <div v-if="results.supporting.evidence.length === 0" class="no-signals">
-                        No supporting evidence found.
-                    </div>
-                    <SignalCard
-                        v-for="(item, idx) in results.supporting.evidence"
-                        :key="'s-' + idx"
-                        :evidence="item"
-                        @inspect="(neid: string) => $emit('inspect', neid)"
-                    />
-
-                    <v-card
-                        v-if="results.supporting.analysis"
-                        variant="tonal"
-                        color="success"
-                        class="analysis-card"
-                    >
-                        <v-card-title class="analysis-title">
-                            <v-icon size="small" class="mr-1">mdi-text-box-outline</v-icon>
-                            Analysis
-                        </v-card-title>
-                        <v-card-text class="analysis-text">
-                            {{ results.supporting.analysis }}
-                        </v-card-text>
-                    </v-card>
-                </div>
+                <v-card variant="tonal" color="success" class="analysis-card">
+                    <v-card-title class="analysis-title">
+                        <v-icon size="small" class="mr-2">mdi-thumb-up-outline</v-icon>
+                        Supporting Argument
+                    </v-card-title>
+                    <v-card-text class="analysis-text">
+                        {{ report.supporting_argument || 'No supporting argument provided.' }}
+                    </v-card-text>
+                </v-card>
             </v-col>
 
             <v-col cols="12" md="6">
-                <div class="signal-column contradicting">
-                    <div class="column-header">
-                        <v-icon color="warning" class="mr-2">mdi-thumb-down-outline</v-icon>
-                        <span class="column-title">Contradicting Signals</span>
-                        <v-chip size="x-small" color="warning" variant="tonal">
-                            {{ results.contradicting.evidence.length }}
-                        </v-chip>
-                    </div>
-
-                    <div v-if="results.contradicting.evidence.length === 0" class="no-signals">
-                        No contradicting evidence found.
-                    </div>
-                    <SignalCard
-                        v-for="(item, idx) in results.contradicting.evidence"
-                        :key="'c-' + idx"
-                        :evidence="item"
-                        @inspect="(neid: string) => $emit('inspect', neid)"
-                    />
-
-                    <v-card
-                        v-if="results.contradicting.analysis"
-                        variant="tonal"
-                        color="warning"
-                        class="analysis-card"
-                    >
-                        <v-card-title class="analysis-title">
-                            <v-icon size="small" class="mr-1">mdi-text-box-outline</v-icon>
-                            Analysis
-                        </v-card-title>
-                        <v-card-text class="analysis-text">
-                            {{ results.contradicting.analysis }}
-                        </v-card-text>
-                    </v-card>
-                </div>
+                <v-card variant="tonal" color="warning" class="analysis-card">
+                    <v-card-title class="analysis-title">
+                        <v-icon size="small" class="mr-2">mdi-thumb-down-outline</v-icon>
+                        Contradicting Argument
+                    </v-card-title>
+                    <v-card-text class="analysis-text">
+                        {{ report.contradicting_argument || 'No contradicting argument provided.' }}
+                    </v-card-text>
+                </v-card>
             </v-col>
         </v-row>
 
-        <v-card v-if="results.limitations" variant="outlined" class="limitations-card mt-4">
-            <v-card-title class="limitations-title">
-                <v-icon size="small" class="mr-1">mdi-alert-circle-outline</v-icon>
-                Limitations & Caveats
+        <!-- Final analysis -->
+        <v-card v-if="report.final_analysis" variant="outlined" class="final-analysis-card mt-4">
+            <v-card-title class="final-analysis-title">
+                <v-icon size="small" class="mr-2">mdi-scale-balance</v-icon>
+                Final Analysis
             </v-card-title>
-            <v-card-text class="limitations-text">
-                {{ results.limitations }}
+            <v-card-text class="analysis-text">
+                {{ report.final_analysis }}
             </v-card-text>
         </v-card>
 
+        <!-- Raw entity data (expandable) -->
+        <v-expansion-panels
+            v-if="Object.keys(report.entity_data).length"
+            variant="accordion"
+            class="mt-4"
+        >
+            <v-expansion-panel v-for="(data, entityName) in report.entity_data" :key="entityName">
+                <v-expansion-panel-title class="entity-data-title">
+                    <v-icon size="small" class="mr-2">mdi-database-outline</v-icon>
+                    {{ entityName }}
+                    <v-chip
+                        v-if="data.neid"
+                        size="x-small"
+                        variant="outlined"
+                        class="ml-2 neid-chip"
+                        @click.stop="$emit('inspect', data.neid)"
+                    >
+                        {{ data.neid }}
+                    </v-chip>
+                    <v-chip size="x-small" variant="tonal" class="ml-2">
+                        {{ entityDataSummary(data) }}
+                    </v-chip>
+                </v-expansion-panel-title>
+                <v-expansion-panel-text>
+                    <EntityDataSection
+                        v-if="data.news?.length"
+                        title="News"
+                        icon="mdi-newspaper-variant-outline"
+                        :items="data.news"
+                        :columns="['title', 'date', 'sentiment', 'url']"
+                    />
+                    <EntityDataSection
+                        v-if="data.stock_prices?.length"
+                        title="Stock Prices"
+                        icon="mdi-chart-line"
+                        :items="data.stock_prices.slice(0, 20)"
+                        :columns="['date', 'open', 'high', 'low', 'close', 'volume']"
+                    />
+                    <EntityDataSection
+                        v-if="data.filings?.length"
+                        title="Filings"
+                        icon="mdi-file-document-outline"
+                        :items="data.filings"
+                        :columns="['form_type', 'date', 'description']"
+                    />
+                    <EntityDataSection
+                        v-if="data.events?.length"
+                        title="Events"
+                        icon="mdi-calendar-star"
+                        :items="data.events"
+                        :columns="['category', 'date', 'description']"
+                    />
+                    <EntityDataSection
+                        v-if="data.relationships?.length"
+                        title="Relationships"
+                        icon="mdi-graph-outline"
+                        :items="data.relationships"
+                        :columns="['name', 'neid']"
+                        @inspect="(neid: string) => $emit('inspect', neid)"
+                    />
+                </v-expansion-panel-text>
+            </v-expansion-panel>
+        </v-expansion-panels>
+
+        <!-- Macro data (expandable) -->
+        <v-expansion-panels
+            v-if="Object.keys(report.macro_data).length"
+            variant="accordion"
+            class="mt-4"
+        >
+            <v-expansion-panel v-for="(series, query) in report.macro_data" :key="query">
+                <v-expansion-panel-title class="entity-data-title">
+                    <v-icon size="small" class="mr-2">mdi-trending-up</v-icon>
+                    Macro: {{ query }}
+                    <v-chip size="x-small" variant="tonal" class="ml-2">
+                        {{ Array.isArray(series) ? series.length : 0 }} series
+                    </v-chip>
+                </v-expansion-panel-title>
+                <v-expansion-panel-text>
+                    <pre class="raw-data">{{ JSON.stringify(series, null, 2) }}</pre>
+                </v-expansion-panel-text>
+            </v-expansion-panel>
+        </v-expansion-panels>
+
+        <!-- Show Your Work -->
         <v-expansion-panels v-if="stepsWithResponses.length" variant="accordion" class="mt-4">
             <v-expansion-panel>
                 <v-expansion-panel-title class="provenance-title">
@@ -140,10 +179,10 @@
 </template>
 
 <script setup lang="ts">
-    import type { ThesisResults, ResearchStep } from '~/composables/useThesisResearch';
+    import type { ReportResult, ResearchStep } from '~/composables/useThesisResearch';
 
     const props = defineProps<{
-        results: ThesisResults;
+        report: ReportResult;
         steps?: ResearchStep[];
     }>();
 
@@ -153,13 +192,123 @@
         inspect: [neid: string];
     }>();
 
+    const entityNames = computed(() => {
+        const entities = props.report.query?.entities ?? [];
+        return entities
+            .filter((e) => e.status === 'resolved')
+            .map((e) => ({
+                name: e.name || e.mentioned_as,
+                neid: e.neid,
+            }));
+    });
+
     const stepsWithResponses = computed(() => (props.steps || []).filter((s) => s.response));
+
+    function entityDataSummary(data: any): string {
+        const parts: string[] = [];
+        if (data.news?.length) parts.push(`${data.news.length} news`);
+        if (data.stock_prices?.length) parts.push(`${data.stock_prices.length} prices`);
+        if (data.filings?.length) parts.push(`${data.filings.length} filings`);
+        if (data.events?.length) parts.push(`${data.events.length} events`);
+        if (data.relationships?.length) parts.push(`${data.relationships.length} relationships`);
+        return parts.join(', ') || 'no data';
+    }
 
     function formatArgs(args: Record<string, any>): string {
         const entries = Object.entries(args);
         if (entries.length === 0) return '';
         return entries.map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(', ');
     }
+</script>
+
+<script lang="ts">
+    /**
+     * Inline sub-component for rendering a section of entity data as a table.
+     */
+    export const EntityDataSection = defineComponent({
+        name: 'EntityDataSection',
+        props: {
+            title: { type: String, required: true },
+            icon: { type: String, required: true },
+            items: { type: Array as () => any[], required: true },
+            columns: { type: Array as () => string[], required: true },
+        },
+        emits: ['inspect'],
+        setup(props, { emit }) {
+            return () =>
+                h('div', { class: 'entity-data-section' }, [
+                    h('div', { class: 'entity-data-section-header' }, [
+                        h(
+                            resolveComponent('v-icon'),
+                            { size: 'x-small', class: 'mr-1' },
+                            () => props.icon
+                        ),
+                        h('span', props.title),
+                        h(
+                            resolveComponent('v-chip'),
+                            { size: 'x-small', variant: 'tonal', class: 'ml-2' },
+                            () => `${props.items.length}`
+                        ),
+                    ]),
+                    h(
+                        resolveComponent('v-table'),
+                        { dense: true, class: 'entity-data-table' },
+                        () => [
+                            h('thead', [
+                                h(
+                                    'tr',
+                                    props.columns.map((col) => h('th', { key: col }, col))
+                                ),
+                            ]),
+                            h(
+                                'tbody',
+                                props.items.slice(0, 20).map((item, idx) =>
+                                    h(
+                                        'tr',
+                                        { key: idx },
+                                        props.columns.map((col) => {
+                                            const val = item[col];
+                                            if (col === 'neid' && val) {
+                                                return h('td', { key: col }, [
+                                                    h(
+                                                        'span',
+                                                        {
+                                                            class: 'linked-neid',
+                                                            onClick: () =>
+                                                                emit('inspect', String(val)),
+                                                        },
+                                                        String(val)
+                                                    ),
+                                                ]);
+                                            }
+                                            if (col === 'url' && val) {
+                                                return h('td', { key: col }, [
+                                                    h(
+                                                        'a',
+                                                        {
+                                                            href: val,
+                                                            target: '_blank',
+                                                            rel: 'noopener',
+                                                            class: 'data-link',
+                                                        },
+                                                        'link'
+                                                    ),
+                                                ]);
+                                            }
+                                            return h(
+                                                'td',
+                                                { key: col },
+                                                val != null ? String(val) : '—'
+                                            );
+                                        })
+                                    )
+                                )
+                            ),
+                        ]
+                    ),
+                ]);
+        },
+    });
 </script>
 
 <style scoped>
@@ -194,58 +343,124 @@
         color: var(--lv-silver);
     }
 
-    .column-header {
-        display: flex;
-        align-items: center;
-        gap: 4px;
-        margin-bottom: 12px;
+    .entity-link {
+        cursor: pointer;
     }
 
-    .column-title {
-        font-family: var(--font-headline);
-        font-weight: 400;
-        font-size: 1rem;
-        letter-spacing: 0.02em;
-        flex: 1;
-    }
-
-    .no-signals {
-        color: var(--lv-silver);
-        font-size: 0.9rem;
-        font-style: italic;
-        padding: 12px 0;
+    .entity-link:hover {
+        border-color: rgb(var(--v-theme-primary));
     }
 
     .analysis-card {
-        margin-top: 12px;
+        height: 100%;
     }
 
     .analysis-title {
         font-family: var(--font-headline);
-        font-size: 0.85rem;
+        font-size: 0.95rem;
         padding-bottom: 0;
     }
 
     .analysis-text {
         font-size: 0.9rem;
-        line-height: 1.6;
+        line-height: 1.7;
+        white-space: pre-wrap;
     }
 
-    .limitations-card {
-        border-color: var(--lv-silver);
+    .final-analysis-card {
+        border-color: rgba(128, 128, 128, 0.3);
     }
 
-    .limitations-title {
+    .final-analysis-title {
         font-family: var(--font-headline);
-        font-size: 0.85rem;
-        color: var(--lv-silver);
+        font-size: 0.95rem;
         padding-bottom: 0;
     }
 
-    .limitations-text {
-        font-size: 0.85rem;
+    .entity-data-title {
+        font-family: var(--font-headline);
+        font-size: 0.9rem;
+    }
+
+    .neid-chip {
+        font-family: var(--font-mono);
+        font-size: 0.6rem;
+        cursor: pointer;
+    }
+
+    .neid-chip:hover {
+        border-color: rgb(var(--v-theme-primary));
+    }
+
+    .entity-data-section {
+        margin-bottom: 16px;
+    }
+
+    .entity-data-section-header {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        margin-bottom: 8px;
+        font-family: var(--font-mono);
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
         color: var(--lv-silver);
-        line-height: 1.5;
+    }
+
+    .entity-data-table {
+        font-size: 0.75rem;
+    }
+
+    .entity-data-table th {
+        font-family: var(--font-mono);
+        font-size: 0.65rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--lv-silver);
+    }
+
+    .entity-data-table td {
+        font-family: var(--font-mono);
+        font-size: 0.7rem;
+        max-width: 300px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .linked-neid {
+        color: rgb(var(--v-theme-primary));
+        cursor: pointer;
+        text-decoration: underline;
+        text-decoration-style: dotted;
+    }
+
+    .linked-neid:hover {
+        text-decoration-style: solid;
+    }
+
+    .data-link {
+        color: rgb(var(--v-theme-primary));
+        text-decoration: none;
+    }
+
+    .data-link:hover {
+        text-decoration: underline;
+    }
+
+    .raw-data {
+        font-family: var(--font-mono);
+        font-size: 0.7rem;
+        line-height: 1.4;
+        color: var(--lv-silver);
+        background: rgba(128, 128, 128, 0.05);
+        border-radius: 4px;
+        padding: 8px;
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: 300px;
+        overflow-y: auto;
     }
 
     .provenance-title {
