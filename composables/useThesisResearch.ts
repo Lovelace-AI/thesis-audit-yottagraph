@@ -194,6 +194,41 @@ export function useThesisResearch() {
     }
 
     // -----------------------------------------------------------------------
+    // ADK function_response unwrapper
+    // -----------------------------------------------------------------------
+
+    function unwrapFunctionResponse(raw: any): any | null {
+        if (!raw) return null;
+
+        // Case 1: raw is already a parsed object with the fields we expect
+        if (typeof raw === 'object' && raw.status) return raw;
+
+        // Case 2: ADK wraps tool returns as {result: "<json string>"}
+        if (typeof raw === 'object') {
+            const inner = raw.result ?? raw.content ?? raw.output;
+            if (typeof inner === 'string') {
+                try {
+                    return JSON.parse(inner);
+                } catch {
+                    return null;
+                }
+            }
+            if (typeof inner === 'object' && inner?.status) return inner;
+        }
+
+        // Case 3: raw is a plain JSON string
+        if (typeof raw === 'string') {
+            try {
+                return JSON.parse(raw);
+            } catch {
+                return null;
+            }
+        }
+
+        return null;
+    }
+
+    // -----------------------------------------------------------------------
     // Send a message to a specific agent
     // -----------------------------------------------------------------------
 
@@ -254,22 +289,9 @@ export function useThesisResearch() {
                     const respName = data.name || lastCallName;
 
                     if (respName === 'research_iteration' && opts?.trackProgress) {
-                        const respText =
-                            typeof data.response === 'string'
-                                ? data.response
-                                : JSON.stringify(data.response);
-                        let parsed: any = null;
-                        try {
-                            parsed =
-                                typeof data.response === 'object'
-                                    ? data.response
-                                    : JSON.parse(respText);
-                        } catch {
-                            // unparseable
-                        }
+                        const parsed = unwrapFunctionResponse(data.response);
 
                         if (parsed) {
-                            // Update the latest iteration with results
                             const iterations = [...progress.value];
                             const latest = iterations[iterations.length - 1];
                             if (latest) {
@@ -629,17 +651,40 @@ export function useThesisResearch() {
                 data_needs: qr.data_needs,
             };
 
-            const { researchData } = await sendToAgent(
+            const { text: researchText, researchData } = await sendToAgent(
                 'researcher',
                 JSON.stringify(researchInput),
                 { trackProgress: true }
             );
 
-            if (!researchData?.research) {
-                throw new Error(
+            // Primary path: agent returned structured final data
+            let calls = researchData?.research?.calls;
+            let showYourWork = researchData?.show_your_work || {};
+
+            // Fallback: reconstruct from accumulated progress iterations
+            if (!calls || calls.length === 0) {
+                const reconstructed = progress.value.flatMap((iter) =>
+                    iter.calls.map((c) => ({
+                        id: c.id,
+                        type: c.type,
+                        params: c.params,
+                        status: c.status,
+                        result: c.summary,
+                    }))
+                );
+                if (reconstructed.length > 0) {
+                    calls = reconstructed;
+                    showYourWork = {};
+                }
+            }
+
+            if (!calls || calls.length === 0) {
+                const err = new Error(
                     'Research Agent did not return accumulated data. ' +
                         'The research loop may not have completed.'
                 );
+                (err as any).agentText = researchText;
+                throw err;
             }
 
             // Stage 3: Report
@@ -647,7 +692,7 @@ export function useThesisResearch() {
 
             const reportInput = {
                 query: qr,
-                calls: researchData.research.calls || [],
+                calls,
             };
 
             const { text: reportText } = await sendToAgent('report', JSON.stringify(reportInput));
@@ -659,8 +704,8 @@ export function useThesisResearch() {
             ) {
                 report.value = {
                     query: qr,
-                    calls: researchData.research.calls || [],
-                    show_your_work: researchData.show_your_work || {},
+                    calls,
+                    show_your_work: showYourWork,
                     supporting_argument: reportParsed.supporting_argument || '',
                     contradicting_argument: reportParsed.contradicting_argument || '',
                     final_analysis: reportParsed.final_analysis || '',
@@ -672,10 +717,34 @@ export function useThesisResearch() {
             }
         } catch (e: any) {
             error.value = e.message || 'Research failed.';
+            const dbgRequests: ErrorDetail['requests'] = (e as any).debugRequests || [];
+            if ((e as any).agentText) {
+                dbgRequests.push({
+                    url: '(agent response text)',
+                    method: 'SSE',
+                    responseText: (e as any).agentText,
+                });
+            }
+            if (progress.value.length > 0) {
+                dbgRequests.push({
+                    url: '(accumulated progress)',
+                    method: 'internal',
+                    responseText: JSON.stringify(
+                        progress.value.map((it) => ({
+                            iteration: it.iteration,
+                            status: it.status,
+                            reasoning: it.reasoning,
+                            calls: it.calls.length,
+                        })),
+                        null,
+                        2
+                    ),
+                });
+            }
             errorDetail.value = {
                 message: error.value!,
                 stage: 'Research / Report',
-                requests: (e as any).debugRequests || [],
+                requests: dbgRequests,
             };
             status.value = 'error';
         }
