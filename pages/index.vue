@@ -48,6 +48,7 @@
                         :steps="progress"
                         @edit="handleEdit"
                         @reset="handleReset"
+                        @inspect="inspectEntity"
                     />
                     <v-card v-else-if="rawFallback" variant="outlined" class="raw-fallback">
                         <v-card-title class="raw-title">Agent Response</v-card-title>
@@ -67,6 +68,15 @@
                         <v-btn color="primary" @click="handleRetry">Retry</v-btn>
                     </div>
                 </div>
+            </div>
+
+            <!-- Entity Info Card (anchored at bottom when a NEID is selected) -->
+            <div v-if="inspectedNeid" class="content-area">
+                <EntityInfoCard
+                    :neid="inspectedNeid"
+                    @close="inspectedNeid = ''"
+                    @inspect="inspectEntity"
+                />
             </div>
         </div>
     </div>
@@ -90,6 +100,16 @@
     } = useThesisResearch();
 
     const inputText = ref('');
+    const inspectedNeid = ref('');
+
+    function inspectEntity(neid: string) {
+        inspectedNeid.value = neid;
+        nextTick(() => {
+            document
+                .querySelector('.entity-info-card')
+                ?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        });
+    }
 
     function handleSubmit(thesisText: string) {
         inputText.value = thesisText;
@@ -102,11 +122,13 @@
 
     function handleEdit() {
         const currentThesis = thesis.value;
+        inspectedNeid.value = '';
         reset();
         inputText.value = currentThesis;
     }
 
     function handleReset() {
+        inspectedNeid.value = '';
         reset();
         inputText.value = '';
     }

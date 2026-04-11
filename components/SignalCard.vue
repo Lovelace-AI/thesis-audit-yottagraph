@@ -32,7 +32,8 @@
                     v-if="evidence.neid"
                     size="x-small"
                     variant="outlined"
-                    class="provenance-chip neid-chip"
+                    class="provenance-chip neid-chip clickable"
+                    @click="$emit('inspect', evidence.neid!)"
                 >
                     <v-icon start size="x-small">mdi-identifier</v-icon>
                     {{ evidence.neid }}
@@ -56,6 +57,10 @@
 
     const props = defineProps<{
         evidence: EvidenceItem;
+    }>();
+
+    defineEmits<{
+        inspect: [neid: string];
     }>();
 
     const SOURCE_CONFIG: Record<string, { icon: string; color: string }> = {
@@ -145,6 +150,15 @@
         max-width: 180px;
         overflow: hidden;
         text-overflow: ellipsis;
+    }
+
+    .clickable {
+        cursor: pointer;
+    }
+
+    .clickable:hover {
+        border-color: rgb(var(--v-theme-primary));
+        color: rgb(var(--v-theme-primary));
     }
 
     .tool-chip {

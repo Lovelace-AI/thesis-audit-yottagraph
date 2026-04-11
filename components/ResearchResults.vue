@@ -33,6 +33,7 @@
                         v-for="(item, idx) in results.supporting.evidence"
                         :key="'s-' + idx"
                         :evidence="item"
+                        @inspect="(neid: string) => $emit('inspect', neid)"
                     />
 
                     <v-card
@@ -69,6 +70,7 @@
                         v-for="(item, idx) in results.contradicting.evidence"
                         :key="'c-' + idx"
                         :evidence="item"
+                        @inspect="(neid: string) => $emit('inspect', neid)"
                     />
 
                     <v-card
@@ -148,6 +150,7 @@
     defineEmits<{
         edit: [];
         reset: [];
+        inspect: [neid: string];
     }>();
 
     const stepsWithResponses = computed(() => (props.steps || []).filter((s) => s.response));

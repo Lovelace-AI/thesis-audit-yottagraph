@@ -758,7 +758,9 @@ proceed with full research:
 Rules for Phase 2:
 - The "source" field must be one of: news, filing, stock, event, relationship, macro.
 - EVERY evidence item MUST include "neid" and "tool_used" from the tool output.
-  Copy the NEID exactly as it appears in the tool's response text.
+  NEIDs are 20-digit numeric strings like "00327906234544446929". Copy them
+  EXACTLY as they appear in the tool's response. NEVER invent or abbreviate NEIDs.
+  If the tool output says "NEID: 00327906234544446929", use "00327906234544446929".
 - Include "source_url" when the tool provided a URL (article links, FRED URLs, etc.).
 - Be thorough: check multiple data types for each entity.
 - Be balanced: actively look for BOTH supporting and contradicting evidence.
