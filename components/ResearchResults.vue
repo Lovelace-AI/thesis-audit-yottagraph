@@ -99,6 +99,31 @@
             </v-card-text>
         </v-card>
 
+        <v-expansion-panels v-if="stepsWithResponses.length" variant="accordion" class="mt-4">
+            <v-expansion-panel>
+                <v-expansion-panel-title class="provenance-title">
+                    <v-icon size="small" class="mr-2">mdi-magnify-scan</v-icon>
+                    Show Your Work
+                    <v-chip size="x-small" variant="tonal" class="ml-2">
+                        {{ stepsWithResponses.length }} tool calls
+                    </v-chip>
+                </v-expansion-panel-title>
+                <v-expansion-panel-text>
+                    <div v-for="step in stepsWithResponses" :key="step.id" class="provenance-step">
+                        <div class="provenance-step-header">
+                            <v-chip size="x-small" variant="tonal" color="primary">
+                                {{ step.tool }}
+                            </v-chip>
+                            <span class="provenance-step-args">{{ formatArgs(step.args) }}</span>
+                        </div>
+                        <pre v-if="step.response" class="provenance-step-response">{{
+                            step.response
+                        }}</pre>
+                    </div>
+                </v-expansion-panel-text>
+            </v-expansion-panel>
+        </v-expansion-panels>
+
         <div class="results-actions">
             <v-btn variant="outlined" @click="$emit('edit')">
                 <v-icon start>mdi-pencil-outline</v-icon>
@@ -113,16 +138,25 @@
 </template>
 
 <script setup lang="ts">
-    import type { ThesisResults } from '~/composables/useThesisResearch';
+    import type { ThesisResults, ResearchStep } from '~/composables/useThesisResearch';
 
-    defineProps<{
+    const props = defineProps<{
         results: ThesisResults;
+        steps?: ResearchStep[];
     }>();
 
     defineEmits<{
         edit: [];
         reset: [];
     }>();
+
+    const stepsWithResponses = computed(() => (props.steps || []).filter((s) => s.response));
+
+    function formatArgs(args: Record<string, any>): string {
+        const entries = Object.entries(args);
+        if (entries.length === 0) return '';
+        return entries.map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(', ');
+    }
 </script>
 
 <style scoped>
@@ -209,6 +243,50 @@
         font-size: 0.85rem;
         color: var(--lv-silver);
         line-height: 1.5;
+    }
+
+    .provenance-title {
+        font-family: var(--font-mono);
+        font-size: 0.8rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+
+    .provenance-step {
+        padding: 8px 0;
+        border-bottom: 1px solid rgba(128, 128, 128, 0.1);
+    }
+
+    .provenance-step:last-child {
+        border-bottom: none;
+    }
+
+    .provenance-step-header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 4px;
+    }
+
+    .provenance-step-args {
+        font-family: var(--font-mono);
+        font-size: 0.7rem;
+        color: var(--lv-silver);
+    }
+
+    .provenance-step-response {
+        font-family: var(--font-mono);
+        font-size: 0.7rem;
+        line-height: 1.4;
+        color: var(--lv-silver);
+        background: rgba(128, 128, 128, 0.05);
+        border-radius: 4px;
+        padding: 8px;
+        margin-top: 4px;
+        white-space: pre-wrap;
+        word-break: break-word;
+        max-height: 200px;
+        overflow-y: auto;
     }
 
     .results-actions {

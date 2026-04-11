@@ -45,6 +45,7 @@
                     <ResearchResults
                         v-if="results"
                         :results="results"
+                        :steps="progress"
                         @edit="handleEdit"
                         @reset="handleReset"
                     />

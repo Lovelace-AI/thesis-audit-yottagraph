@@ -34,6 +34,9 @@ export interface EvidenceItem {
     detail: string;
     date?: string;
     entity?: string;
+    neid?: string;
+    source_url?: string;
+    tool_used?: string;
 }
 
 export interface SignalGroup {
@@ -56,6 +59,7 @@ export interface ResearchStep {
     args: Record<string, any>;
     label: string;
     timestamp: number;
+    response?: string;
 }
 
 export interface EntitySelection {
@@ -186,16 +190,32 @@ export function useThesisResearch() {
 
         const processSSE = async (response: Response): Promise<string | null> => {
             let text = '';
+            let lastCallName = '';
             for await (const { event, data } of readSSE(response)) {
                 if (event === 'function_call') {
+                    lastCallName = data.name || '?';
                     const step: ResearchStep = {
                         id: crypto.randomUUID(),
-                        tool: data.name || '?',
+                        tool: lastCallName,
                         args: data.args || {},
-                        label: toolLabel(data.name || '', data.args || {}),
+                        label: toolLabel(lastCallName, data.args || {}),
                         timestamp: Date.now(),
                     };
                     progress.value = [...progress.value, step];
+                } else if (event === 'function_response') {
+                    const respName = data.name || lastCallName;
+                    const respText =
+                        typeof data.response === 'string'
+                            ? data.response
+                            : JSON.stringify(data.response, null, 2);
+                    const steps = progress.value;
+                    for (let i = steps.length - 1; i >= 0; i--) {
+                        if (steps[i].tool === respName && !steps[i].response) {
+                            steps[i] = { ...steps[i], response: respText };
+                            progress.value = [...steps];
+                            break;
+                        }
+                    }
                 } else if (event === 'text') {
                     text = data.text || text;
                 } else if (event === 'done') {

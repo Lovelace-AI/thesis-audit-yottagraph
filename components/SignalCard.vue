@@ -11,6 +11,42 @@
             </div>
             <div class="signal-title">{{ evidence.title }}</div>
             <div class="signal-detail">{{ evidence.detail }}</div>
+
+            <div
+                v-if="evidence.neid || evidence.source_url || evidence.tool_used"
+                class="signal-provenance"
+            >
+                <v-chip
+                    v-if="evidence.source_url"
+                    size="x-small"
+                    variant="outlined"
+                    :href="evidence.source_url"
+                    target="_blank"
+                    rel="noopener"
+                    class="provenance-chip"
+                >
+                    <v-icon start size="x-small">mdi-open-in-new</v-icon>
+                    Source
+                </v-chip>
+                <v-chip
+                    v-if="evidence.neid"
+                    size="x-small"
+                    variant="outlined"
+                    class="provenance-chip neid-chip"
+                >
+                    <v-icon start size="x-small">mdi-identifier</v-icon>
+                    {{ evidence.neid }}
+                </v-chip>
+                <v-chip
+                    v-if="evidence.tool_used"
+                    size="x-small"
+                    variant="outlined"
+                    class="provenance-chip tool-chip"
+                >
+                    <v-icon start size="x-small">mdi-wrench-outline</v-icon>
+                    {{ toolDisplayName(evidence.tool_used) }}
+                </v-chip>
+            </div>
         </v-card-text>
     </v-card>
 </template>
@@ -30,6 +66,21 @@
         relationship: { icon: 'mdi-graph-outline', color: 'primary' },
         macro: { icon: 'mdi-trending-up', color: 'info' },
     };
+
+    const TOOL_NAMES: Record<string, string> = {
+        get_entity_news: 'News',
+        get_stock_prices: 'Stock Prices',
+        get_entity_filings: 'Filings',
+        get_entity_relationships: 'Relationships',
+        get_entity_events: 'Events',
+        get_macro_data: 'Macro Data',
+        get_schema: 'Schema',
+        lookup_entity: 'Entity Lookup',
+    };
+
+    function toolDisplayName(tool: string): string {
+        return TOOL_NAMES[tool] || tool;
+    }
 
     const sourceIcon = computed(
         () => SOURCE_CONFIG[props.evidence.source]?.icon || 'mdi-information-outline'
@@ -73,5 +124,30 @@
         font-size: 0.85rem;
         color: var(--lv-silver);
         line-height: 1.5;
+    }
+
+    .signal-provenance {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 10px;
+        padding-top: 8px;
+        border-top: 1px solid rgba(128, 128, 128, 0.15);
+    }
+
+    .provenance-chip {
+        font-family: var(--font-mono);
+        font-size: 0.65rem;
+        letter-spacing: 0.02em;
+    }
+
+    .neid-chip {
+        max-width: 180px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    .tool-chip {
+        color: var(--lv-silver);
     }
 </style>

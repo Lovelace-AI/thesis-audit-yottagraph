@@ -124,9 +124,13 @@ def get_entity_news(entity_name: str) -> str:
         if not articles:
             return f"No news articles found linked to '{entity_name}'."
 
-        lines = [f"News for '{entity_name}' ({len(articles)} article(s)):"]
+        lines = [f"News for '{entity_name}' (NEID: {neid}, {len(articles)} article(s)):"]
         for a in articles[:15]:
-            lines.append(f"  - [{a.get('date', '?')}] {a.get('title', 'Untitled')}")
+            url_part = f", URL: {a['url']}" if a.get("url") else ""
+            lines.append(
+                f"  - [{a.get('date', '?')}] {a.get('title', 'Untitled')} "
+                f"(NEID: {a.get('neid', '?')}{url_part})"
+            )
             if a.get("sentiment"):
                 lines.append(f"    Sentiment: {a['sentiment']}")
         return "\n".join(lines)
@@ -161,7 +165,8 @@ def get_stock_prices(entity_name: str) -> str:
         props_resp.raise_for_status()
         values = props_resp.json().get("values", [])
 
-        price_data = _extract_price_data(values)
+        price_data = _extract_price_data(values, neid)
+        instrument_neid = neid
         if not price_data:
             linked_expr = json.dumps({
                 "type": "linked",
@@ -174,6 +179,7 @@ def get_stock_prices(entity_name: str) -> str:
             find_resp.raise_for_status()
             linked_eids = find_resp.json().get("eids", [])
             if linked_eids:
+                instrument_neid = linked_eids[0]
                 props2 = elemental_client.post(
                     "/elemental/entities/properties",
                     data={
@@ -182,12 +188,18 @@ def get_stock_prices(entity_name: str) -> str:
                     },
                 )
                 props2.raise_for_status()
-                price_data = _extract_price_data(props2.json().get("values", []))
+                price_data = _extract_price_data(props2.json().get("values", []), instrument_neid)
 
         if not price_data:
             return f"No stock price data found for '{entity_name}'."
 
-        lines = [f"Stock data for '{entity_name}' ({len(price_data)} data point(s)):"]
+        ticker = price_data[0].get("ticker", "")
+        ticker_part = f", ticker: {ticker}" if ticker else ""
+        lines = [
+            f"Stock data for '{entity_name}' "
+            f"(NEID: {instrument_neid}{ticker_part}, "
+            f"{len(price_data)} data point(s)):"
+        ]
         for p in price_data[:20]:
             lines.append(
                 f"  [{p.get('date', '?')}] "
@@ -247,11 +259,14 @@ def get_entity_filings(entity_name: str) -> str:
         if not filings:
             return f"No SEC filing data found for '{entity_name}'."
 
-        lines = [f"Filings for '{entity_name}' ({len(filings)} filing(s)):"]
+        lines = [f"Filings for '{entity_name}' (NEID: {neid}, {len(filings)} filing(s)):"]
         for f in filings[:15]:
+            acc = f.get("accession_number")
+            acc_part = f", accession: {acc}" if acc else ""
             lines.append(
                 f"  - [{f.get('date', '?')}] {f.get('form_type', '?')}: "
-                f"{f.get('description', 'No description')}"
+                f"{f.get('description', 'No description')} "
+                f"(NEID: {f.get('neid', '?')}{acc_part})"
             )
         return "\n".join(lines)
     except Exception as e:
@@ -356,11 +371,12 @@ def get_entity_events(entity_name: str) -> str:
         if not events:
             return f"No event data found for '{entity_name}'."
 
-        lines = [f"Events involving '{entity_name}' ({len(events)} event(s)):"]
+        lines = [f"Events involving '{entity_name}' (NEID: {neid}, {len(events)} event(s)):"]
         for ev in events[:15]:
             lines.append(
                 f"  - [{ev.get('date', '?')}] {ev.get('category', '?')}: "
-                f"{ev.get('description', 'No description')}"
+                f"{ev.get('description', 'No description')} "
+                f"(NEID: {ev.get('neid', '?')})"
             )
             if ev.get("likelihood"):
                 lines.append(f"    Likelihood: {ev['likelihood']}")
@@ -415,8 +431,13 @@ def get_macro_data(query: str) -> str:
                 by_entity[eid] = {}
             pid = v.get("pid")
             val = v.get("value")
+            name_str = str(v.get("name", "")).lower()
             if pid == 8:
                 by_entity[eid]["name"] = val
+            elif "fred_series_id" in name_str and val:
+                by_entity[eid]["fred_series_id"] = str(val)
+            elif "release_link" in name_str and val:
+                by_entity[eid]["release_link"] = str(val)
             else:
                 by_entity[eid].setdefault("properties", []).append(
                     {"pid": pid, "value": val, "recorded_at": v.get("recorded_at", "")}
@@ -425,7 +446,12 @@ def get_macro_data(query: str) -> str:
         lines = [f"Macro data matching '{query}' ({len(by_entity)} series):"]
         for eid, info in list(by_entity.items())[:10]:
             name = info.get("name", eid)
-            lines.append(f"  - {name} (NEID: {eid})")
+            series_id = info.get("fred_series_id", "")
+            url = info.get("release_link") or (
+                f"https://fred.stlouisfed.org/series/{series_id}" if series_id else ""
+            )
+            url_part = f", URL: {url}" if url else ""
+            lines.append(f"  - {name} (NEID: {eid}{url_part})")
             for prop in (info.get("properties") or [])[:3]:
                 lines.append(f"    {prop['value']} (recorded: {prop['recorded_at']})")
         return "\n".join(lines)
@@ -499,12 +525,11 @@ def _resolve_top_entity(name: str) -> str | None:
 
 def _extract_news_from_properties(values: list[dict]) -> list[dict]:
     """Extract news article info from property values."""
-    articles: list[dict] = []
     by_entity: dict[str, dict] = {}
     for v in values:
         eid = v.get("eid", "")
         if eid not in by_entity:
-            by_entity[eid] = {}
+            by_entity[eid] = {"neid": eid}
         pid = v.get("pid")
         val = v.get("value")
         if pid == 8:
@@ -513,42 +538,51 @@ def _extract_news_from_properties(values: list[dict]) -> list[dict]:
         attrs = v.get("attributes", {})
         if attrs:
             for _aid, attr_val in attrs.items():
-                if isinstance(attr_val, (int, float)) and -1 <= attr_val <= 1:
+                if isinstance(attr_val, str) and attr_val.startswith("http"):
+                    by_entity[eid]["url"] = attr_val
+                elif isinstance(attr_val, (int, float)) and -1 <= attr_val <= 1:
                     by_entity[eid]["sentiment"] = attr_val
 
+    articles = []
     for eid, info in by_entity.items():
         if info.get("title"):
             articles.append({
+                "neid": info.get("neid", eid),
                 "title": info["title"],
                 "date": (info.get("date") or "")[:10],
                 "sentiment": info.get("sentiment"),
+                "url": info.get("url"),
             })
     articles.sort(key=lambda a: a.get("date", ""), reverse=True)
     return articles
 
 
-def _extract_price_data(values: list[dict]) -> list[dict]:
+def _extract_price_data(values: list[dict], neid: str | None = None) -> list[dict]:
     """Extract OHLCV stock price data from property values."""
     price_points: dict[str, dict] = {}
+    ticker = None
     for v in values:
+        name_str = str(v.get("name", "")).lower()
+        val = v.get("value")
+        if "ticker" in name_str and val:
+            ticker = str(val)
         recorded = v.get("recorded_at", "")
         date_key = recorded[:10] if recorded else ""
         if not date_key:
             continue
-        pid = v.get("pid")
-        val = v.get("value")
         if date_key not in price_points:
             price_points[date_key] = {"date": date_key}
-        price_names = {
-            "open": val, "high": val, "low": val, "close": val, "volume": val,
-        }
-        name_str = str(v.get("name", str(pid))).lower()
-        for key in price_names:
+        for key in ("open", "high", "low", "close", "volume"):
             if key in name_str:
                 price_points[date_key][key] = val
                 break
 
     result = sorted(price_points.values(), key=lambda p: p.get("date", ""), reverse=True)
+    for p in result:
+        if neid:
+            p["neid"] = neid
+        if ticker:
+            p["ticker"] = ticker
     return result
 
 
@@ -558,11 +592,14 @@ def _extract_filings(values: list[dict]) -> list[dict]:
     for v in values:
         eid = v.get("eid", "")
         if eid not in by_entity:
-            by_entity[eid] = {}
+            by_entity[eid] = {"neid": eid}
         pid = v.get("pid")
         val = v.get("value")
+        name_str = str(v.get("name", "")).lower()
         if pid == 8:
             by_entity[eid]["description"] = val
+        if "accession" in name_str and val:
+            by_entity[eid]["accession_number"] = str(val)
         by_entity[eid].setdefault("date", v.get("recorded_at", "")[:10])
         val_str = str(val).lower() if val else ""
         for form in ["10-k", "10-q", "8-k", "def 14a", "13f", "sc 13"]:
@@ -574,9 +611,11 @@ def _extract_filings(values: list[dict]) -> list[dict]:
     for eid, info in by_entity.items():
         if info.get("form_type") or info.get("description"):
             filings.append({
+                "neid": info.get("neid", eid),
                 "form_type": info.get("form_type", "Unknown"),
                 "date": info.get("date", "?"),
                 "description": info.get("description", ""),
+                "accession_number": info.get("accession_number"),
             })
     filings.sort(key=lambda f: f.get("date", ""), reverse=True)
     return filings
@@ -588,7 +627,7 @@ def _extract_events(values: list[dict]) -> list[dict]:
     for v in values:
         eid = v.get("eid", "")
         if eid not in by_entity:
-            by_entity[eid] = {}
+            by_entity[eid] = {"neid": eid}
         val = v.get("value")
         name = str(v.get("name", "")).lower() if v.get("name") else ""
         pid = v.get("pid")
@@ -689,7 +728,10 @@ proceed with full research:
         "title": "Short description of the evidence",
         "detail": "What was found and why it supports the thesis",
         "date": "2025-01-15",
-        "entity": "Entity Name"
+        "entity": "Entity Name",
+        "neid": "the NEID from the tool output that this fact came from",
+        "source_url": "URL if available (article URL, FRED link, etc.)",
+        "tool_used": "get_entity_news"
       }
     ],
     "analysis": "Your synthesis of the overall supporting case"
@@ -701,7 +743,10 @@ proceed with full research:
         "title": "Short description",
         "detail": "What was found and why it contradicts the thesis",
         "date": "2025-03-10",
-        "entity": "Entity Name"
+        "entity": "Entity Name",
+        "neid": "the NEID from the tool output",
+        "source_url": "URL if available",
+        "tool_used": "get_stock_prices"
       }
     ],
     "analysis": "Your synthesis of the overall contradicting case"
@@ -712,6 +757,9 @@ proceed with full research:
 
 Rules for Phase 2:
 - The "source" field must be one of: news, filing, stock, event, relationship, macro.
+- EVERY evidence item MUST include "neid" and "tool_used" from the tool output.
+  Copy the NEID exactly as it appears in the tool's response text.
+- Include "source_url" when the tool provided a URL (article links, FRED URLs, etc.).
 - Be thorough: check multiple data types for each entity.
 - Be balanced: actively look for BOTH supporting and contradicting evidence.
 - If you find no evidence for one side, say so honestly in the analysis.
