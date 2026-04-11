@@ -17,6 +17,7 @@ Local testing:
 
 import json
 
+import httpx
 from google.adk.agents import Agent
 
 try:
@@ -514,6 +515,94 @@ def _exec_get_news(entity_name: str, neid: str) -> tuple[str, dict]:
         return f"Error fetching news for '{entity_name}': {e}", {}
 
 
+def _get_mcp_bearer_token() -> str | None:
+    """Get a bearer token for Lovelace MCP servers (GCP service account only)."""
+    try:
+        import google.auth.transport.requests
+        import google.oauth2.id_token
+
+        request = google.auth.transport.requests.Request()
+        return google.oauth2.id_token.fetch_id_token(request, "queryserver:api")
+    except Exception:
+        return None
+
+
+def _call_mcp_tool(mcp_url: str, tool_name: str, arguments: dict) -> dict | None:
+    """Call an MCP tool and return the parsed result, or None on failure."""
+    token = _get_mcp_bearer_token()
+    if not token:
+        return None
+    try:
+        resp = httpx.post(
+            mcp_url,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": arguments},
+            },
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            timeout=30.0,
+        )
+        if resp.status_code != 200:
+            return None
+        result = resp.json().get("result", {})
+        for item in result.get("content", []):
+            if item.get("type") == "text":
+                try:
+                    return json.loads(item["text"])
+                except (json.JSONDecodeError, TypeError):
+                    return {"text": item["text"]}
+        return result
+    except Exception:
+        return None
+
+
+_ELEMENTAL_MCP_URL = "https://mcp.news.prod.g.lovelace.ai/elemental/mcp"
+_STOCKS_MCP_URL = "https://mcp.news.prod.g.lovelace.ai/stocks/mcp"
+
+
+def _fetch_stock_prices_mcp(ticker: str, entity_name: str = "") -> list[dict]:
+    """Fetch OHLCV data via Lovelace MCP (avoids mega-entity timeouts)."""
+    # Try the stocks MCP first
+    for tool_name in ["stocks_get_prices", "get_prices", "get_stock_prices"]:
+        data = _call_mcp_tool(
+            _STOCKS_MCP_URL, tool_name, {"ticker": ticker, "range": "6m"}
+        )
+        if data:
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict) and "prices" in data:
+                return data["prices"]
+
+    # Try elemental MCP with history
+    entity_query = ticker or entity_name
+    if entity_query:
+        data = _call_mcp_tool(
+            _ELEMENTAL_MCP_URL,
+            "elemental_get_entity",
+            {
+                "entity": entity_query,
+                "flavor": "financial_instrument",
+                "properties": ["close_price", "open_price", "high_price", "low_price", "trading_volume"],
+                "history": {"limit": 180},
+            },
+        )
+        if data and isinstance(data, dict):
+            hist = data.get("historical_properties", {})
+            closes = hist.get("close_price", [])
+            if closes:
+                prices: list[dict] = []
+                for entry in closes:
+                    point: dict = {
+                        "date": (entry.get("recorded_at") or "")[:10],
+                        "close": entry.get("value"),
+                    }
+                    prices.append(point)
+                return prices
+    return []
+
+
 def _exec_get_stock_prices(entity_name: str, neid: str) -> tuple[str, dict]:
     """Fetch OHLCV data or financial fundamentals."""
     _load_schema()
@@ -522,16 +611,22 @@ def _exec_get_stock_prices(entity_name: str, neid: str) -> tuple[str, dict]:
     ticker = None
     fundamentals: dict = {}
 
+    # Strategy 0: resolve ticker first, then try MCP (avoids mega-entity timeouts)
     try:
         values = _fetch_properties([neid], timeout=15.0)
-        prices = _extract_prices(values)
         ticker = _extract_ticker(values)
+        prices = _extract_prices(values)
     except Exception:
         pass
 
+    if not ticker:
+        ticker = _get_ticker_for_entity(neid)
+
+    if not prices and ticker:
+        prices = _fetch_stock_prices_mcp(ticker)
+
+    # Strategy 1: find FI entity and fetch its properties
     if not prices:
-        if not ticker:
-            ticker = _get_ticker_for_entity(neid)
         fi_neid = None
         if ticker:
             fi_neid = _find_financial_instrument(ticker)
@@ -546,6 +641,7 @@ def _exec_get_stock_prices(entity_name: str, neid: str) -> tuple[str, dict]:
             except Exception:
                 pass
 
+    # Strategy 2: fall back to fundamentals from the organization
     if not prices:
         org_neid = _find_organization_with_data(entity_name)
         if org_neid:
@@ -568,7 +664,7 @@ def _exec_get_stock_prices(entity_name: str, neid: str) -> tuple[str, dict]:
     if prices:
         full_data["prices"] = prices
         dates = [p["date"] for p in prices if p.get("date")]
-        closes = [p["close"] for p in prices if p.get("close") is not None]
+        closes = [p.get("close") for p in prices if p.get("close") is not None]
         date_range = f"{min(dates)} to {max(dates)}" if dates else "unknown"
         price_range = f"${min(closes):.2f} – ${max(closes):.2f}" if closes else "unknown"
         parts.append(
