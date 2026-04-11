@@ -93,7 +93,12 @@ def _get_session(session_id: str | None = None) -> tuple[str, dict]:
     if session_id and session_id in _sessions:
         return session_id, _sessions[session_id]
     sid = session_id or str(uuid.uuid4())
-    _sessions[sid] = {"entity_data": {}, "macro_data": {}}
+    _sessions[sid] = {
+        "entity_data": {},
+        "macro_data": {},
+        "recorded_entity_data": {},
+        "recorded_macro_data": {},
+    }
     return sid, _sessions[sid]
 
 
@@ -539,21 +544,95 @@ def get_entity_properties(entity_name: str, neid: str) -> str:
         return f"Error fetching properties for '{entity_name}': {e}"
 
 
-def finalize_research() -> str:
-    """Return the full accumulated research JSON.
+def record_result(entity_name: str = "", data_type: str = "all") -> str:
+    """Promote staged exploration data into the final research output.
 
-    Call this when you have gathered enough data. The returned JSON contains
-    all raw data collected during this session.
+    Call this after exploring data to mark specific results as important
+    for the downstream analysis.
+
+    Args:
+        entity_name: Entity name (for entity data) or macro query string
+            (when data_type is "macro").
+        data_type: What to record. Options:
+            - "all": everything staged for this entity
+            - "news", "stock_prices", "filings", "events", "relationships",
+              "properties", "financial_fundamentals", "ticker": specific
+              entity data category
+            - "macro": macro/economic concept data (entity_name is the
+              query string)
 
     Returns:
-        The complete research JSON as a string.
+        Confirmation of what was recorded.
+    """
+    global _active_session_id
+    if not _active_session_id or _active_session_id not in _sessions:
+        return "No active research session."
+
+    session = _sessions[_active_session_id]
+
+    if data_type == "macro":
+        staged = session["macro_data"].get(entity_name)
+        if not staged:
+            return f"No staged macro data for query '{entity_name}'."
+        import copy
+        session["recorded_macro_data"][entity_name] = copy.deepcopy(staged)
+        count = len(staged) if isinstance(staged, list) else 1
+        return f"Recorded macro data for '{entity_name}' ({count} concept(s))."
+
+    staged_entity = session["entity_data"].get(entity_name)
+    if not staged_entity:
+        return f"No staged data for entity '{entity_name}'."
+
+    import copy
+    recorded = session["recorded_entity_data"]
+    if entity_name not in recorded:
+        recorded[entity_name] = {"neid": staged_entity.get("neid", "")}
+
+    if data_type == "all":
+        recorded[entity_name] = copy.deepcopy(staged_entity)
+        keys = [k for k in staged_entity if k != "neid"]
+        return f"Recorded all data for '{entity_name}': {', '.join(keys)}."
+
+    value = staged_entity.get(data_type)
+    if value is None:
+        return f"No staged '{data_type}' data for entity '{entity_name}'."
+
+    recorded[entity_name][data_type] = copy.deepcopy(value)
+    if isinstance(value, list):
+        return f"Recorded {data_type} for '{entity_name}' ({len(value)} item(s))."
+    return f"Recorded {data_type} for '{entity_name}'."
+
+
+def finalize_research() -> str:
+    """Return the final research JSON.
+
+    The output contains two sections:
+    - ``research``: only the data explicitly promoted via ``record_result``.
+      This is what the downstream report agent uses.
+    - ``show_your_work``: the full staged exploration data — every API call
+      the agent made, whether recorded or not.
+
+    Returns:
+        The research JSON as a string.
     """
     global _active_session_id
     if not _active_session_id or _active_session_id not in _sessions:
         return json.dumps({"error": "No active research session"})
 
     session = _sessions[_active_session_id]
-    result = json.dumps(session, default=str)
+    result = json.dumps(
+        {
+            "research": {
+                "entity_data": session["recorded_entity_data"],
+                "macro_data": session["recorded_macro_data"],
+            },
+            "show_your_work": {
+                "entity_data": session["entity_data"],
+                "macro_data": session["macro_data"],
+            },
+        },
+        default=str,
+    )
 
     del _sessions[_active_session_id]
     _active_session_id = None
@@ -973,6 +1052,8 @@ INSTRUCTION = """\
 You are a financial data researcher. Your job is to gather data relevant to
 a financial thesis by calling the available research tools.
 
+You work in two phases: **Explore**, then **Record**.
+
 ## Input
 
 You are given a finalized QueryRewrite JSON containing:
@@ -982,24 +1063,47 @@ You are given a finalized QueryRewrite JSON containing:
 - `data_needs`: categories of data to fetch (news, stock_prices, filings, etc.)
 - Optionally `macro_indicators`: macroeconomic concepts with search queries
 
-## Your task
+## Phase 1: Explore
 
-1. For EACH resolved entity, call the appropriate tools based on `data_needs`.
-2. If `data_needs` includes "macro" or there are `macro_indicators`, call
-   `get_macro` for each indicator's `search_query`.
-3. Examine the summaries returned. If data seems thin, try related entities
-   via `get_relationships`, then fetch data for those too.
-4. When you have enough data, call `finalize_research()` to return the
-   accumulated results.
+Call any research tool as many times as you like. Every call fetches data
+and returns a summary, but the data is only **staged** internally — it will
+NOT appear in the final output unless you explicitly record it.
+
+Use this phase to understand the data landscape:
+- Fetch news, stock prices, filings, events, and macro data for each entity.
+- Follow relationships to discover related entities.
+- Call tools on related entities if the data seems relevant.
+- If a tool call fails, try once more. If it still fails, move on.
+
+## Phase 2: Record
+
+Once you have explored enough to know which data is relevant to the thesis
+and its claims, call `record_result` to promote that data into the final
+research output.
+
+- `record_result(entity_name, data_type)` — record a specific category
+  (e.g. "news", "stock_prices", "filings", "events", "relationships",
+  "financial_fundamentals", "ticker") for an entity.
+- `record_result(entity_name, "all")` — record everything for an entity.
+- `record_result(query, "macro")` — record a macro/economic concept result.
+
+Only record data that is relevant to evaluating the thesis. Not everything
+you explored needs to be recorded — be selective.
+
+## Phase 3: Finalize
+
+When done, call `finalize_research()`. This returns JSON with two sections:
+- `research`: only the data you explicitly recorded (used by the report).
+- `show_your_work`: everything you explored (shown to the user for
+  transparency).
 
 ## Rules
 
-- Call tools for EVERY entity and data need. Do not skip any.
-- If a tool call fails, try once more. If it still fails, move on.
-- You may call `get_relationships` to discover additional relevant entities.
-- Do NOT fabricate data. You can only read summaries.
-- When done, call `finalize_research()` — this is mandatory.
-- Do NOT write a report or analysis. Just gather data.
+- Explore broadly first, then record selectively.
+- Do NOT fabricate data. You can only read tool summaries.
+- You MUST call `record_result` for at least the key data before finalizing.
+- You MUST call `finalize_research()` when done — this is mandatory.
+- Do NOT write a report or analysis. Just gather and curate data.
 """
 
 root_agent = Agent(
@@ -1014,6 +1118,7 @@ root_agent = Agent(
         get_relationships,
         get_macro,
         get_entity_properties,
+        record_result,
         finalize_research,
     ],
 )
