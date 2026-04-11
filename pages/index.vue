@@ -76,7 +76,89 @@
                 <div class="content-area">
                     <v-alert type="error" variant="tonal" class="mt-4">
                         {{ error || 'An unexpected error occurred.' }}
+                        <template v-if="errorDetail" #append>
+                            <v-btn
+                                variant="text"
+                                size="small"
+                                density="compact"
+                                :prepend-icon="
+                                    showErrorDebug ? 'mdi-chevron-up' : 'mdi-chevron-down'
+                                "
+                                @click="showErrorDebug = !showErrorDebug"
+                            >
+                                Raw Details
+                            </v-btn>
+                        </template>
                     </v-alert>
+
+                    <v-expand-transition>
+                        <v-card
+                            v-if="showErrorDebug && errorDetail"
+                            variant="outlined"
+                            class="mt-2 error-debug-card"
+                        >
+                            <v-card-title class="text-body-2 font-weight-bold">
+                                Debug — {{ errorDetail.stage }}
+                            </v-card-title>
+                            <v-card-text class="pa-0">
+                                <div
+                                    v-for="(req, idx) in errorDetail.requests"
+                                    :key="idx"
+                                    class="error-debug-request"
+                                >
+                                    <div class="error-debug-header">
+                                        <code class="error-debug-method">{{ req.method }}</code>
+                                        <code class="error-debug-url">{{ req.url }}</code>
+                                        <v-chip
+                                            v-if="req.status"
+                                            size="x-small"
+                                            :color="
+                                                req.status >= 200 && req.status < 300
+                                                    ? 'success'
+                                                    : 'error'
+                                            "
+                                            variant="tonal"
+                                        >
+                                            {{ req.status }}
+                                        </v-chip>
+                                        <v-chip
+                                            v-if="req.contentType"
+                                            size="x-small"
+                                            variant="outlined"
+                                        >
+                                            {{ req.contentType }}
+                                        </v-chip>
+                                    </div>
+                                    <details v-if="req.body" class="error-debug-details">
+                                        <summary>Request Body</summary>
+                                        <pre class="error-debug-pre">{{
+                                            typeof req.body === 'string'
+                                                ? req.body
+                                                : JSON.stringify(req.body, null, 2)
+                                        }}</pre>
+                                    </details>
+                                    <details
+                                        v-if="req.responseText"
+                                        class="error-debug-details"
+                                        open
+                                    >
+                                        <summary>Response</summary>
+                                        <pre class="error-debug-pre">{{ req.responseText }}</pre>
+                                    </details>
+                                    <div v-if="req.error" class="error-debug-error">
+                                        <strong>Error:</strong> {{ req.error }}
+                                    </div>
+                                </div>
+                                <div
+                                    v-if="!errorDetail.requests.length"
+                                    class="pa-4 text-body-2 text-medium-emphasis"
+                                >
+                                    No request details captured.
+                                </div>
+                            </v-card-text>
+                        </v-card>
+                    </v-expand-transition>
+
                     <div class="d-flex justify-center mt-4">
                         <v-btn color="primary" @click="handleRetry">Retry</v-btn>
                     </div>
@@ -107,10 +189,13 @@
         report,
         rawFallback,
         error,
+        errorDetail,
         submitThesis,
         confirmEntities,
         reset,
     } = useThesisResearch();
+
+    const showErrorDebug = ref(false);
 
     const inputText = ref('');
     const inspectedNeid = ref('');
@@ -147,6 +232,7 @@
     }
 
     function handleRetry() {
+        showErrorDebug.value = false;
         if (inputText.value) {
             submitThesis(inputText.value);
         }
@@ -265,5 +351,70 @@
         white-space: pre-wrap;
         font-size: 0.9rem;
         line-height: 1.6;
+    }
+
+    .error-debug-card {
+        border-color: rgba(var(--v-theme-error), 0.3);
+        max-height: 500px;
+        overflow-y: auto;
+    }
+
+    .error-debug-request {
+        padding: 12px 16px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .error-debug-request:last-child {
+        border-bottom: none;
+    }
+
+    .error-debug-header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin-bottom: 8px;
+    }
+
+    .error-debug-method {
+        font-weight: 700;
+        font-size: 0.75rem;
+        color: var(--lv-silver);
+    }
+
+    .error-debug-url {
+        font-size: 0.75rem;
+        word-break: break-all;
+    }
+
+    .error-debug-details {
+        margin-top: 6px;
+    }
+
+    .error-debug-details summary {
+        cursor: pointer;
+        font-size: 0.75rem;
+        font-family: var(--font-mono);
+        color: var(--lv-silver);
+        user-select: none;
+    }
+
+    .error-debug-pre {
+        background: rgba(0, 0, 0, 0.3);
+        border-radius: 4px;
+        padding: 8px 12px;
+        margin-top: 4px;
+        font-size: 0.7rem;
+        line-height: 1.5;
+        white-space: pre-wrap;
+        word-break: break-all;
+        max-height: 200px;
+        overflow-y: auto;
+    }
+
+    .error-debug-error {
+        margin-top: 6px;
+        font-size: 0.75rem;
+        color: rgb(var(--v-theme-error));
     }
 </style>

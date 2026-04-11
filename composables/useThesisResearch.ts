@@ -82,6 +82,20 @@ export type ResearchStatus =
     | 'done'
     | 'error';
 
+export interface ErrorDetail {
+    message: string;
+    stage: string;
+    requests: {
+        url: string;
+        method: string;
+        body?: any;
+        status?: number;
+        contentType?: string;
+        responseText?: string;
+        error?: string;
+    }[];
+}
+
 // ---------------------------------------------------------------------------
 // Tool name → human-readable label
 // ---------------------------------------------------------------------------
@@ -114,6 +128,7 @@ export function useThesisResearch() {
     const report = ref<ReportResult | null>(null);
     const rawFallback = ref<string | null>(null);
     const error = ref<string | null>(null);
+    const errorDetail = ref<ErrorDetail | null>(null);
 
     // Per-agent session IDs (separate ADK deployments)
     const sessionIds = ref<{
@@ -212,7 +227,9 @@ export function useThesisResearch() {
 
         let finalText = '';
         let researchData: any = undefined;
+        const debugRequests: ErrorDetail['requests'] = [];
 
+        const localStreamUrl = `/api/agent/${engineId}/stream`;
         const portalStreamUrl = `${gatewayUrl}/api/agents/${orgId}/${engineId}/stream`;
         const portalQueryUrl = `${gatewayUrl}/api/agents/${orgId}/${engineId}/query`;
 
@@ -287,29 +304,95 @@ export function useThesisResearch() {
             return text;
         };
 
-        // Try portal streaming proxy
+        // Try app's own server route (handles auth + Agent Engine proxy)
+        try {
+            const localResp = await fetch(localStreamUrl, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(body),
+            });
+            const localCt = localResp.headers.get('content-type') || '';
+            const localDbg: ErrorDetail['requests'][0] = {
+                url: localStreamUrl,
+                method: 'POST',
+                body,
+                status: localResp.status,
+                contentType: localCt,
+            };
+            if (localResp.ok && localResp.body && localCt.includes('text/event-stream')) {
+                const result = await processSSE(localResp);
+                if (result !== null) return { text: result, researchData };
+                localDbg.responseText = '(SSE stream returned null — error event or empty)';
+            } else if (!localCt.includes('text/event-stream')) {
+                localDbg.responseText = await localResp.text().catch(() => '(unreadable)');
+            }
+            debugRequests.push(localDbg);
+        } catch (e: any) {
+            debugRequests.push({
+                url: localStreamUrl,
+                method: 'POST',
+                body,
+                error: e.message || String(e),
+            });
+        }
+
+        // Fallback: try portal streaming proxy
         try {
             const portalResp = await fetch(portalStreamUrl, {
                 method: 'POST',
                 headers,
                 body: JSON.stringify(body),
             });
-            if (portalResp.ok && portalResp.body) {
+            const portalCt = portalResp.headers.get('content-type') || '';
+            const portalDbg: ErrorDetail['requests'][0] = {
+                url: portalStreamUrl,
+                method: 'POST',
+                body,
+                status: portalResp.status,
+                contentType: portalCt,
+            };
+            if (portalResp.ok && portalResp.body && portalCt.includes('text/event-stream')) {
                 const result = await processSSE(portalResp);
                 if (result !== null) return { text: result, researchData };
+                portalDbg.responseText = '(SSE stream returned null — error event or empty)';
+            } else if (!portalCt.includes('text/event-stream')) {
+                portalDbg.responseText = await portalResp.text().catch(() => '(unreadable)');
+                if ((portalDbg.responseText?.length ?? 0) > 2000) {
+                    portalDbg.responseText =
+                        portalDbg.responseText!.slice(0, 2000) + '…[truncated]';
+                }
             }
-        } catch {
-            // Portal stream unavailable
+            debugRequests.push(portalDbg);
+        } catch (e: any) {
+            debugRequests.push({
+                url: portalStreamUrl,
+                method: 'POST',
+                body,
+                error: e.message || String(e),
+            });
         }
 
         // Fall back to buffered /query endpoint
-        const queryResp = await $fetch<{ output: any; session_id: string | null }>(portalQueryUrl, {
-            method: 'POST',
-            headers,
-            body,
-        });
-        if (queryResp.session_id) sessionIds.value[agentKey] = queryResp.session_id;
-        return { text: extractAgentText(queryResp.output) };
+        try {
+            const queryResp = await $fetch<{ output: any; session_id: string | null }>(
+                portalQueryUrl,
+                { method: 'POST', headers, body }
+            );
+            if (queryResp.session_id) sessionIds.value[agentKey] = queryResp.session_id;
+            return { text: extractAgentText(queryResp.output) };
+        } catch (e: any) {
+            debugRequests.push({
+                url: portalQueryUrl,
+                method: 'POST',
+                body,
+                error: e.message || String(e),
+            });
+        }
+
+        // All attempts failed — throw with debug info attached
+        const err = new Error(`All agent communication attempts failed for ${agentKey}.`);
+        (err as any).debugRequests = debugRequests;
+        throw err;
     }
 
     // -----------------------------------------------------------------------
@@ -387,6 +470,7 @@ export function useThesisResearch() {
         rawFallback.value = null;
         progress.value = [];
         error.value = null;
+        errorDetail.value = null;
         sessionIds.value = { queryRewrite: null, researcher: null, report: null };
 
         try {
@@ -421,6 +505,11 @@ export function useThesisResearch() {
             status.value = 'awaiting_confirmation';
         } catch (e: any) {
             error.value = e.message || 'Failed to parse thesis.';
+            errorDetail.value = {
+                message: error.value!,
+                stage: 'Query Rewrite',
+                requests: (e as any).debugRequests || [],
+            };
             status.value = 'error';
         }
     }
@@ -504,6 +593,11 @@ export function useThesisResearch() {
                 status.value = 'awaiting_confirmation';
             } catch (e: any) {
                 error.value = e.message || 'Failed to re-resolve entities.';
+                errorDetail.value = {
+                    message: error.value!,
+                    stage: 'Entity Re-resolution',
+                    requests: (e as any).debugRequests || [],
+                };
                 status.value = 'error';
             }
         } else {
@@ -519,6 +613,7 @@ export function useThesisResearch() {
         status.value = 'researching';
         progress.value = [];
         error.value = null;
+        errorDetail.value = null;
 
         try {
             const researchInput = {
@@ -577,6 +672,11 @@ export function useThesisResearch() {
             }
         } catch (e: any) {
             error.value = e.message || 'Research failed.';
+            errorDetail.value = {
+                message: error.value!,
+                stage: 'Research / Report',
+                requests: (e as any).debugRequests || [],
+            };
             status.value = 'error';
         }
     }
@@ -593,6 +693,7 @@ export function useThesisResearch() {
         report.value = null;
         rawFallback.value = null;
         error.value = null;
+        errorDetail.value = null;
         sessionIds.value = { queryRewrite: null, researcher: null, report: null };
         agentIds.value = { queryRewrite: null, researcher: null, report: null };
     }
@@ -605,6 +706,7 @@ export function useThesisResearch() {
         report: computed(() => report.value),
         rawFallback: computed(() => rawFallback.value),
         error: computed(() => error.value),
+        errorDetail: computed(() => errorDetail.value),
         submitThesis,
         confirmEntities,
         reset,
