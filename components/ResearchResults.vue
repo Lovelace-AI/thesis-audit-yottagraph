@@ -55,111 +55,95 @@
             </v-card-text>
         </v-card>
 
-        <!-- Raw entity data (expandable) -->
-        <v-expansion-panels
-            v-if="Object.keys(report.entity_data).length"
-            variant="accordion"
-            class="mt-4"
-        >
-            <v-expansion-panel v-for="(data, entityName) in report.entity_data" :key="entityName">
-                <v-expansion-panel-title class="entity-data-title">
+        <!-- Research calls (expandable) -->
+        <v-expansion-panels v-if="report.calls?.length" variant="accordion" class="mt-4">
+            <v-expansion-panel>
+                <v-expansion-panel-title class="provenance-title">
                     <v-icon size="small" class="mr-2">mdi-database-outline</v-icon>
-                    {{ entityName }}
-                    <v-chip
-                        v-if="data.neid"
-                        size="x-small"
-                        variant="outlined"
-                        class="ml-2 neid-chip"
-                        @click.stop="$emit('inspect', data.neid)"
-                    >
-                        {{ data.neid }}
-                    </v-chip>
+                    Research Data
                     <v-chip size="x-small" variant="tonal" class="ml-2">
-                        {{ entityDataSummary(data) }}
+                        {{ report.calls.length }} API calls
                     </v-chip>
                 </v-expansion-panel-title>
                 <v-expansion-panel-text>
-                    <EntityDataSection
-                        v-if="data.news?.length"
-                        title="News"
-                        icon="mdi-newspaper-variant-outline"
-                        :items="data.news"
-                        :columns="['title', 'date', 'sentiment', 'url']"
-                    />
-                    <EntityDataSection
-                        v-if="data.stock_prices?.length"
-                        title="Stock Prices"
-                        icon="mdi-chart-line"
-                        :items="data.stock_prices.slice(0, 20)"
-                        :columns="['date', 'open', 'high', 'low', 'close', 'volume']"
-                    />
-                    <EntityDataSection
-                        v-if="data.filings?.length"
-                        title="Filings"
-                        icon="mdi-file-document-outline"
-                        :items="data.filings"
-                        :columns="['form_type', 'date', 'description']"
-                    />
-                    <EntityDataSection
-                        v-if="data.events?.length"
-                        title="Events"
-                        icon="mdi-calendar-star"
-                        :items="data.events"
-                        :columns="['category', 'date', 'description']"
-                    />
-                    <EntityDataSection
-                        v-if="data.relationships?.length"
-                        title="Relationships"
-                        icon="mdi-graph-outline"
-                        :items="data.relationships"
-                        :columns="['name', 'neid']"
-                        @inspect="(neid: string) => $emit('inspect', neid)"
-                    />
+                    <div v-for="call in report.calls" :key="call.id" class="provenance-step">
+                        <div class="provenance-step-header">
+                            <v-chip size="x-small" variant="tonal" color="primary">
+                                {{ call.type }}
+                            </v-chip>
+                            <span class="provenance-step-args">{{ formatCallParams(call) }}</span>
+                            <v-chip
+                                size="x-small"
+                                :color="call.status === 'ok' ? 'success' : 'error'"
+                                variant="tonal"
+                            >
+                                {{ call.status }}
+                            </v-chip>
+                        </div>
+                        <pre v-if="call.result" class="provenance-step-response">{{
+                            call.result
+                        }}</pre>
+                    </div>
                 </v-expansion-panel-text>
             </v-expansion-panel>
         </v-expansion-panels>
 
-        <!-- Macro data (expandable) -->
-        <v-expansion-panels
-            v-if="Object.keys(report.macro_data).length"
-            variant="accordion"
-            class="mt-4"
-        >
-            <v-expansion-panel v-for="(series, query) in report.macro_data" :key="query">
-                <v-expansion-panel-title class="entity-data-title">
-                    <v-icon size="small" class="mr-2">mdi-trending-up</v-icon>
-                    Macro: {{ query }}
-                    <v-chip size="x-small" variant="tonal" class="ml-2">
-                        {{ Array.isArray(series) ? series.length : 0 }} series
-                    </v-chip>
-                </v-expansion-panel-title>
-                <v-expansion-panel-text>
-                    <pre class="raw-data">{{ JSON.stringify(series, null, 2) }}</pre>
-                </v-expansion-panel-text>
-            </v-expansion-panel>
-        </v-expansion-panels>
-
-        <!-- Show Your Work -->
-        <v-expansion-panels v-if="stepsWithResponses.length" variant="accordion" class="mt-4">
+        <!-- Show Your Work (full unabridged results) -->
+        <v-expansion-panels v-if="hasShowYourWork" variant="accordion" class="mt-4">
             <v-expansion-panel>
                 <v-expansion-panel-title class="provenance-title">
                     <v-icon size="small" class="mr-2">mdi-magnify-scan</v-icon>
                     Show Your Work
                     <v-chip size="x-small" variant="tonal" class="ml-2">
-                        {{ stepsWithResponses.length }} tool calls
+                        {{ showYourWorkCount }} full results
                     </v-chip>
                 </v-expansion-panel-title>
                 <v-expansion-panel-text>
-                    <div v-for="step in stepsWithResponses" :key="step.id" class="provenance-step">
+                    <div
+                        v-for="(data, callId) in report.show_your_work"
+                        :key="callId"
+                        class="provenance-step"
+                    >
+                        <div class="provenance-step-header">
+                            <v-chip size="x-small" variant="tonal" color="secondary">
+                                Call #{{ callId }}
+                            </v-chip>
+                        </div>
+                        <pre class="provenance-step-response">{{
+                            JSON.stringify(data, null, 2)
+                        }}</pre>
+                    </div>
+                </v-expansion-panel-text>
+            </v-expansion-panel>
+        </v-expansion-panels>
+
+        <!-- Research iterations log -->
+        <v-expansion-panels v-if="iterations?.length" variant="accordion" class="mt-4">
+            <v-expansion-panel>
+                <v-expansion-panel-title class="provenance-title">
+                    <v-icon size="small" class="mr-2">mdi-repeat</v-icon>
+                    Research Iterations
+                    <v-chip size="x-small" variant="tonal" class="ml-2">
+                        {{ iterations.length }} iterations
+                    </v-chip>
+                </v-expansion-panel-title>
+                <v-expansion-panel-text>
+                    <div v-for="iter in iterations" :key="iter.id" class="provenance-step">
                         <div class="provenance-step-header">
                             <v-chip size="x-small" variant="tonal" color="primary">
-                                {{ step.tool }}
+                                Iteration {{ iter.iteration }}
                             </v-chip>
-                            <span class="provenance-step-args">{{ formatArgs(step.args) }}</span>
+                            <span v-if="iter.reasoning" class="provenance-step-args">
+                                {{ iter.reasoning }}
+                            </span>
                         </div>
-                        <pre v-if="step.response" class="provenance-step-response">{{
-                            step.response
-                        }}</pre>
+                        <div v-for="call in iter.calls" :key="call.id" class="iteration-call">
+                            <v-icon size="x-small" class="mr-1">{{
+                                TOOL_ICONS[call.type] || 'mdi-cog-outline'
+                            }}</v-icon>
+                            <span class="call-type-label">{{ call.label }}</span>
+                            <span class="call-summary-text">{{ call.summary }}</span>
+                        </div>
                     </div>
                 </v-expansion-panel-text>
             </v-expansion-panel>
@@ -179,11 +163,11 @@
 </template>
 
 <script setup lang="ts">
-    import type { ReportResult, ResearchStep } from '~/composables/useThesisResearch';
+    import type { ReportResult, ResearchIteration } from '~/composables/useThesisResearch';
 
     const props = defineProps<{
         report: ReportResult;
-        steps?: ResearchStep[];
+        iterations?: ResearchIteration[];
     }>();
 
     defineEmits<{
@@ -191,6 +175,15 @@
         reset: [];
         inspect: [neid: string];
     }>();
+
+    const TOOL_ICONS: Record<string, string> = {
+        get_news: 'mdi-newspaper-variant-outline',
+        get_stock_prices: 'mdi-chart-line',
+        get_filings: 'mdi-file-document-outline',
+        get_relationships: 'mdi-graph-outline',
+        get_events: 'mdi-calendar-star',
+        get_entity_properties: 'mdi-database-search-outline',
+    };
 
     const entityNames = computed(() => {
         const entities = props.report.query?.entities ?? [];
@@ -202,113 +195,22 @@
             }));
     });
 
-    const stepsWithResponses = computed(() => (props.steps || []).filter((s) => s.response));
+    const hasShowYourWork = computed(() => {
+        const syw = props.report.show_your_work;
+        return syw && typeof syw === 'object' && Object.keys(syw).length > 0;
+    });
 
-    function entityDataSummary(data: any): string {
-        const parts: string[] = [];
-        if (data.news?.length) parts.push(`${data.news.length} news`);
-        if (data.stock_prices?.length) parts.push(`${data.stock_prices.length} prices`);
-        if (data.filings?.length) parts.push(`${data.filings.length} filings`);
-        if (data.events?.length) parts.push(`${data.events.length} events`);
-        if (data.relationships?.length) parts.push(`${data.relationships.length} relationships`);
-        return parts.join(', ') || 'no data';
-    }
+    const showYourWorkCount = computed(() => {
+        const syw = props.report.show_your_work;
+        return syw ? Object.keys(syw).length : 0;
+    });
 
-    function formatArgs(args: Record<string, any>): string {
-        const entries = Object.entries(args);
+    function formatCallParams(call: any): string {
+        const params = call.params || {};
+        const entries = Object.entries(params);
         if (entries.length === 0) return '';
         return entries.map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(', ');
     }
-</script>
-
-<script lang="ts">
-    /**
-     * Inline sub-component for rendering a section of entity data as a table.
-     */
-    export const EntityDataSection = defineComponent({
-        name: 'EntityDataSection',
-        props: {
-            title: { type: String, required: true },
-            icon: { type: String, required: true },
-            items: { type: Array as () => any[], required: true },
-            columns: { type: Array as () => string[], required: true },
-        },
-        emits: ['inspect'],
-        setup(props, { emit }) {
-            return () =>
-                h('div', { class: 'entity-data-section' }, [
-                    h('div', { class: 'entity-data-section-header' }, [
-                        h(
-                            resolveComponent('v-icon'),
-                            { size: 'x-small', class: 'mr-1' },
-                            () => props.icon
-                        ),
-                        h('span', props.title),
-                        h(
-                            resolveComponent('v-chip'),
-                            { size: 'x-small', variant: 'tonal', class: 'ml-2' },
-                            () => `${props.items.length}`
-                        ),
-                    ]),
-                    h(
-                        resolveComponent('v-table'),
-                        { dense: true, class: 'entity-data-table' },
-                        () => [
-                            h('thead', [
-                                h(
-                                    'tr',
-                                    props.columns.map((col) => h('th', { key: col }, col))
-                                ),
-                            ]),
-                            h(
-                                'tbody',
-                                props.items.slice(0, 20).map((item, idx) =>
-                                    h(
-                                        'tr',
-                                        { key: idx },
-                                        props.columns.map((col) => {
-                                            const val = item[col];
-                                            if (col === 'neid' && val) {
-                                                return h('td', { key: col }, [
-                                                    h(
-                                                        'span',
-                                                        {
-                                                            class: 'linked-neid',
-                                                            onClick: () =>
-                                                                emit('inspect', String(val)),
-                                                        },
-                                                        String(val)
-                                                    ),
-                                                ]);
-                                            }
-                                            if (col === 'url' && val) {
-                                                return h('td', { key: col }, [
-                                                    h(
-                                                        'a',
-                                                        {
-                                                            href: val,
-                                                            target: '_blank',
-                                                            rel: 'noopener',
-                                                            class: 'data-link',
-                                                        },
-                                                        'link'
-                                                    ),
-                                                ]);
-                                            }
-                                            return h(
-                                                'td',
-                                                { key: col },
-                                                val != null ? String(val) : '—'
-                                            );
-                                        })
-                                    )
-                                )
-                            ),
-                        ]
-                    ),
-                ]);
-        },
-    });
 </script>
 
 <style scoped>
@@ -377,92 +279,6 @@
         padding-bottom: 0;
     }
 
-    .entity-data-title {
-        font-family: var(--font-headline);
-        font-size: 0.9rem;
-    }
-
-    .neid-chip {
-        font-family: var(--font-mono);
-        font-size: 0.6rem;
-        cursor: pointer;
-    }
-
-    .neid-chip:hover {
-        border-color: rgb(var(--v-theme-primary));
-    }
-
-    .entity-data-section {
-        margin-bottom: 16px;
-    }
-
-    .entity-data-section-header {
-        display: flex;
-        align-items: center;
-        gap: 4px;
-        margin-bottom: 8px;
-        font-family: var(--font-mono);
-        font-size: 0.75rem;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        color: var(--lv-silver);
-    }
-
-    .entity-data-table {
-        font-size: 0.75rem;
-    }
-
-    .entity-data-table th {
-        font-family: var(--font-mono);
-        font-size: 0.65rem;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        color: var(--lv-silver);
-    }
-
-    .entity-data-table td {
-        font-family: var(--font-mono);
-        font-size: 0.7rem;
-        max-width: 300px;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-    }
-
-    .linked-neid {
-        color: rgb(var(--v-theme-primary));
-        cursor: pointer;
-        text-decoration: underline;
-        text-decoration-style: dotted;
-    }
-
-    .linked-neid:hover {
-        text-decoration-style: solid;
-    }
-
-    .data-link {
-        color: rgb(var(--v-theme-primary));
-        text-decoration: none;
-    }
-
-    .data-link:hover {
-        text-decoration: underline;
-    }
-
-    .raw-data {
-        font-family: var(--font-mono);
-        font-size: 0.7rem;
-        line-height: 1.4;
-        color: var(--lv-silver);
-        background: rgba(128, 128, 128, 0.05);
-        border-radius: 4px;
-        padding: 8px;
-        white-space: pre-wrap;
-        word-break: break-word;
-        max-height: 300px;
-        overflow-y: auto;
-    }
-
     .provenance-title {
         font-family: var(--font-mono);
         font-size: 0.8rem;
@@ -505,6 +321,29 @@
         word-break: break-word;
         max-height: 200px;
         overflow-y: auto;
+    }
+
+    .iteration-call {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 0 4px 16px;
+        font-size: 0.75rem;
+    }
+
+    .call-type-label {
+        flex-shrink: 0;
+    }
+
+    .call-summary-text {
+        font-family: var(--font-mono);
+        font-size: 0.7rem;
+        color: var(--lv-silver);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        flex: 1;
+        min-width: 0;
     }
 
     .results-actions {

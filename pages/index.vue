@@ -43,7 +43,7 @@
             <div v-else-if="status === 'researching' || status === 'reporting'">
                 <ThesisBar :thesis="thesis" />
                 <div class="content-area">
-                    <ResearchProgress :steps="progress" />
+                    <ResearchProgress :iterations="progress" />
                     <div v-if="status === 'reporting'" class="d-flex flex-column align-center pa-4">
                         <v-progress-circular indeterminate size="32" class="mb-3" />
                         <span class="status-text">Generating analysis report...</span>
@@ -58,7 +58,7 @@
                     <ResearchResults
                         v-if="report"
                         :report="report"
-                        :steps="progress"
+                        :iterations="progress"
                         @edit="handleEdit"
                         @reset="handleReset"
                         @inspect="inspectEntity"

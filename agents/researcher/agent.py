@@ -1,11 +1,11 @@
 """
-Research Agent — gathers financial data from the Elemental API.
+Research Agent — planner-executor loop for gathering financial data.
 
-The agent decides what data to fetch based on a finalized QueryRewrite.
-Each tool call appends raw API results to an in-memory accumulator and
-returns a read-only summary. When the agent is done, it calls
-finalize_research() which returns the full accumulated JSON — captured
-from the SSE function_response stream by the frontend.
+The outer ADK agent calls research_iteration() in a loop. Each call invokes
+an inner Gemini planner that sees the growing research doc and requests
+batches of API calls. Those calls are executed mechanically, results are
+abridged for the planner's context window, and full results are kept in
+memory for show_your_work.
 
 Local testing:
     export ELEMENTAL_API_URL=https://stable-query.lovelace.ai
@@ -16,7 +16,6 @@ Local testing:
 """
 
 import json
-import uuid
 
 from google.adk.agents import Agent
 
@@ -82,567 +81,9 @@ def _pname(pid: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# In-memory accumulator keyed by session
+# Internal helpers (shared by executors)
 # ---------------------------------------------------------------------------
 
-_sessions: dict[str, dict] = {}
-
-
-def _get_session(session_id: str | None = None) -> tuple[str, dict]:
-    """Get or create a research session."""
-    if session_id and session_id in _sessions:
-        return session_id, _sessions[session_id]
-    sid = session_id or str(uuid.uuid4())
-    _sessions[sid] = {
-        "entity_data": {},
-        "macro_data": {},
-        "recorded_entity_data": {},
-        "recorded_macro_data": {},
-    }
-    return sid, _sessions[sid]
-
-
-def _ensure_entity(session: dict, entity_name: str, neid: str) -> dict:
-    """Ensure an entity bucket exists in the session."""
-    if entity_name not in session["entity_data"]:
-        session["entity_data"][entity_name] = {"neid": neid}
-    return session["entity_data"][entity_name]
-
-
-# Module-level session ID set by the first tool call
-_active_session_id: str | None = None
-
-
-# ---------------------------------------------------------------------------
-# Tools
-# ---------------------------------------------------------------------------
-
-
-def get_news(entity_name: str, neid: str) -> str:
-    """Fetch recent news articles linked to an entity.
-
-    Args:
-        entity_name: Display name of the entity.
-        neid: The 20-digit entity ID.
-
-    Returns:
-        Summary of articles found (count, date range, sentiment).
-    """
-    global _active_session_id
-    _load_schema()
-    sid, session = _get_session(_active_session_id)
-    _active_session_id = sid
-    bucket = _ensure_entity(session, entity_name, neid)
-
-    try:
-        linked_expr = json.dumps({
-            "type": "linked",
-            "linked": {"to_entity": neid, "distance": 1, "direction": "both"},
-        })
-        resp = elemental_client.post(
-            "/elemental/find",
-            data={"expression": linked_expr, "limit": "30"},
-        )
-        resp.raise_for_status()
-        eids = resp.json().get("eids", [])
-        if not eids:
-            return f"No linked entities found for '{entity_name}'."
-
-        values = _fetch_properties_batched(eids[:20], timeout=10.0)
-        articles = _extract_news(values)
-        bucket.setdefault("news", []).extend(articles)
-
-        if not articles:
-            return f"No news articles found for '{entity_name}'."
-
-        sentiments = [a["sentiment"] for a in articles if a.get("sentiment") is not None]
-        dates = [a["date"] for a in articles if a.get("date")]
-        avg_sent = round(sum(sentiments) / len(sentiments), 2) if sentiments else None
-        date_range = f"{min(dates)} to {max(dates)}" if dates else "unknown"
-
-        parts = [f"Found {len(articles)} news article(s) for '{entity_name}'."]
-        parts.append(f"Date range: {date_range}.")
-        if avg_sent is not None:
-            parts.append(f"Average sentiment: {avg_sent} ({len(sentiments)} scored).")
-        return " ".join(parts)
-    except Exception as e:
-        return f"Error fetching news for '{entity_name}': {e}"
-
-
-def get_stock_prices(entity_name: str, neid: str) -> str:
-    """Fetch OHLCV stock price data for an entity.
-
-    Tries several strategies to locate price data:
-    1. Direct property fetch on the entity (works for most stocks)
-    2. If timeout, look up ticker via PID 169 on the organization entity
-       and search for the financial_instrument entity by ticker
-    3. Fall back to financial fundamentals from the org entity
-
-    Args:
-        entity_name: Display name of the entity.
-        neid: The 20-digit entity ID.
-
-    Returns:
-        Summary of price data found (count, date range, price range).
-    """
-    global _active_session_id
-    _load_schema()
-    sid, session = _get_session(_active_session_id)
-    _active_session_id = sid
-    bucket = _ensure_entity(session, entity_name, neid)
-
-    prices: list[dict] = []
-    ticker = None
-
-    # Strategy 1: direct fetch on the provided entity
-    try:
-        values = _fetch_properties([neid], timeout=15.0)
-        prices = _extract_prices(values)
-        ticker = _extract_ticker(values)
-    except Exception:
-        pass
-
-    # Strategy 2: find the financial_instrument by ticker or name
-    if not prices:
-        if not ticker:
-            ticker = _get_ticker_for_entity(neid)
-        fi_neid = None
-        if ticker:
-            fi_neid = _find_financial_instrument(ticker)
-        if not fi_neid:
-            fi_neid = _find_financial_instrument(entity_name)
-        if fi_neid and fi_neid != neid:
-            try:
-                values2 = _fetch_properties([fi_neid], timeout=15.0)
-                prices = _extract_prices(values2)
-                if not ticker:
-                    ticker = _extract_ticker(values2)
-            except Exception:
-                pass
-
-    # Strategy 3: financial fundamentals from the EDGAR organization entity
-    if not prices:
-        org_neid = _find_organization_with_data(entity_name)
-        if org_neid:
-            try:
-                values3 = _fetch_properties([org_neid], timeout=15.0)
-                fundamentals = _extract_fundamentals(values3)
-                if fundamentals:
-                    bucket["financial_fundamentals"] = fundamentals
-                    if not ticker:
-                        ticker = _extract_ticker(values3)
-            except Exception:
-                pass
-
-    if ticker:
-        bucket["ticker"] = ticker
-
-    bucket.setdefault("stock_prices", []).extend(prices)
-
-    if not prices and not bucket.get("financial_fundamentals"):
-        return f"No stock price data found for '{entity_name}'."
-
-    parts = []
-    if prices:
-        dates = [p["date"] for p in prices if p.get("date")]
-        closes = [p["close"] for p in prices if p.get("close") is not None]
-        date_range = f"{min(dates)} to {max(dates)}" if dates else "unknown"
-        price_range = f"${min(closes):.2f} – ${max(closes):.2f}" if closes else "unknown"
-        parts.append(
-            f"Found {len(prices)} OHLCV data point(s) for '{entity_name}'"
-            + (f" (ticker: {ticker})" if ticker else "")
-            + f". Date range: {date_range}. Close price range: {price_range}."
-        )
-    if bucket.get("financial_fundamentals"):
-        f = bucket["financial_fundamentals"]
-        parts.append(
-            f"Financial fundamentals: revenue=${f.get('total_revenue', '?')}, "
-            f"net_income=${f.get('net_income', '?')}, "
-            f"shares_outstanding={f.get('shares_outstanding', '?')}."
-        )
-    return " ".join(parts)
-
-
-def get_filings(entity_name: str, neid: str) -> str:
-    """Fetch SEC filings (10-K, 10-Q, 8-K, etc.) for a company.
-
-    Args:
-        entity_name: Display name of the entity.
-        neid: The 20-digit entity ID.
-
-    Returns:
-        Summary of filings found (count, form types, date range).
-    """
-    global _active_session_id
-    _load_schema()
-    sid, session = _get_session(_active_session_id)
-    _active_session_id = sid
-    bucket = _ensure_entity(session, entity_name, neid)
-
-    try:
-        linked_expr = json.dumps({
-            "type": "linked",
-            "linked": {"to_entity": neid, "distance": 1, "direction": "incoming"},
-        })
-        resp = elemental_client.post(
-            "/elemental/find",
-            data={"expression": linked_expr, "limit": "30"},
-        )
-        resp.raise_for_status()
-        eids = resp.json().get("eids", [])
-        if not eids:
-            return f"No filings found for '{entity_name}'."
-
-        values = _fetch_properties_batched(eids[:20], timeout=10.0)
-        filings = _extract_filings(values)
-        bucket.setdefault("filings", []).extend(filings)
-
-        if not filings:
-            return f"No SEC filing data found for '{entity_name}'."
-
-        form_types = list({f.get("form_type", "?") for f in filings})
-        dates = [f["date"] for f in filings if f.get("date")]
-        date_range = f"{min(dates)} to {max(dates)}" if dates else "unknown"
-
-        return (
-            f"Found {len(filings)} filing(s) for '{entity_name}'. "
-            f"Form types: {', '.join(form_types)}. Date range: {date_range}."
-        )
-    except Exception as e:
-        return f"Error fetching filings for '{entity_name}': {e}"
-
-
-def get_events(entity_name: str, neid: str) -> str:
-    """Fetch events (mergers, IPOs, lawsuits, etc.) involving an entity.
-
-    Args:
-        entity_name: Display name of the entity.
-        neid: The 20-digit entity ID.
-
-    Returns:
-        Summary of events found (count, categories).
-    """
-    global _active_session_id
-    _load_schema()
-    sid, session = _get_session(_active_session_id)
-    _active_session_id = sid
-    bucket = _ensure_entity(session, entity_name, neid)
-
-    try:
-        linked_expr = json.dumps({
-            "type": "linked",
-            "linked": {"to_entity": neid, "distance": 1, "direction": "incoming"},
-        })
-        resp = elemental_client.post(
-            "/elemental/find",
-            data={"expression": linked_expr, "limit": "30"},
-        )
-        resp.raise_for_status()
-        eids = resp.json().get("eids", [])
-        if not eids:
-            return f"No events found for '{entity_name}'."
-
-        values = _fetch_properties_batched(eids[:20], timeout=10.0)
-        events = _extract_events(values)
-        bucket.setdefault("events", []).extend(events)
-
-        if not events:
-            return f"No event data found for '{entity_name}'."
-
-        categories = list({e.get("category", "?") for e in events})
-        return (
-            f"Found {len(events)} event(s) for '{entity_name}'. "
-            f"Categories: {', '.join(categories)}."
-        )
-    except Exception as e:
-        return f"Error fetching events for '{entity_name}': {e}"
-
-
-def get_relationships(entity_name: str, neid: str) -> str:
-    """Fetch entities related to a given entity.
-
-    Args:
-        entity_name: Display name of the entity.
-        neid: The 20-digit entity ID.
-
-    Returns:
-        Summary of related entities found (count, names).
-    """
-    global _active_session_id
-    sid, session = _get_session(_active_session_id)
-    _active_session_id = sid
-    bucket = _ensure_entity(session, entity_name, neid)
-
-    try:
-        linked_expr = json.dumps({
-            "type": "linked",
-            "linked": {"to_entity": neid, "distance": 1, "direction": "both"},
-        })
-        resp = elemental_client.post(
-            "/elemental/find",
-            data={"expression": linked_expr, "limit": "50"},
-        )
-        resp.raise_for_status()
-        eids = resp.json().get("eids", [])
-        if not eids:
-            return f"No related entities found for '{entity_name}'."
-
-        names_resp = elemental_client.post(
-            "/entities/names",
-            json={"neids": eids[:30]},
-            timeout=10.0,
-        )
-        names_resp.raise_for_status()
-        names_map = names_resp.json().get("results", {})
-
-        relationships = []
-        for eid in eids[:30]:
-            name = names_map.get(eid, eid)
-            relationships.append({"neid": eid, "name": name})
-
-        bucket.setdefault("relationships", []).extend(relationships)
-
-        related_names = [r["name"] for r in relationships[:10]]
-        remaining = len(relationships) - 10 if len(relationships) > 10 else 0
-        summary = ", ".join(related_names)
-        if remaining:
-            summary += f", and {remaining} more"
-
-        return f"Found {len(relationships)} related entities for '{entity_name}': {summary}."
-    except Exception as e:
-        return f"Error fetching relationships for '{entity_name}': {e}"
-
-
-def get_macro(query: str) -> str:
-    """Search for macroeconomic concepts and their related entities.
-
-    Uses the ``economic_concept`` entity flavor to find concepts like
-    "federal funds rate", "GDP", "CPI", etc., then resolves their
-    relationships (``financially_impacts``, ``appears_in``) to discover
-    which financial instruments and organizations are affected.
-
-    Args:
-        query: Natural language description (e.g. "federal funds rate", "GDP growth").
-
-    Returns:
-        Summary of matching concepts and impacted entities.
-    """
-    global _active_session_id
-    _load_schema()
-    sid, session = _get_session(_active_session_id)
-    _active_session_id = sid
-
-    try:
-        resp = elemental_client.post(
-            "/entities/search",
-            json={
-                "queries": [{"queryId": 1, "query": query, "flavors": ["economic_concept"]}],
-                "maxResults": 5,
-                "includeNames": True,
-                "includeFlavors": True,
-                "includeScores": True,
-                "minScore": 0.3,
-            },
-            timeout=10.0,
-        )
-        resp.raise_for_status()
-        matches = resp.json().get("results", [{}])[0].get("matches", [])
-        if not matches:
-            return f"No macro/economic concepts found matching '{query}'."
-
-        concepts: list[dict] = []
-        for m in matches[:3]:
-            concept: dict = {
-                "neid": m.get("neid", ""),
-                "name": m.get("name", ""),
-                "score": m.get("score"),
-            }
-
-            concept_neid = concept["neid"]
-            try:
-                values = _fetch_properties([concept_neid], timeout=10.0)
-                fi_pid = _name_to_pid.get("financially_impacts")
-                appears_pid = _name_to_pid.get("appears_in")
-                impacted_neids: list[str] = []
-                for v in values:
-                    pid = v.get("pid")
-                    val = v.get("value")
-                    if pid == fi_pid and val:
-                        impacted_neids.append(str(val))
-                    pname = _pname(pid) if pid else ""
-                    if pname and pname not in ("appears_in", "financially_impacts"):
-                        concept.setdefault("properties", {})[pname] = val
-
-                if impacted_neids:
-                    names_resp = elemental_client.post(
-                        "/entities/names",
-                        json={"neids": impacted_neids[:10]},
-                        timeout=10.0,
-                    )
-                    names_resp.raise_for_status()
-                    names_map = names_resp.json().get("results", {})
-                    concept["impacts"] = [
-                        {"neid": neid, "name": names_map.get(neid, neid)}
-                        for neid in impacted_neids[:10]
-                    ]
-            except Exception:
-                pass
-
-            concepts.append(concept)
-
-        session.setdefault("macro_data", {})[query] = concepts
-
-        summaries = []
-        for c in concepts:
-            detail = c["name"]
-            impacts = c.get("impacts", [])
-            if impacts:
-                impact_names = [i["name"] for i in impacts[:5]]
-                detail += f" → impacts: {', '.join(impact_names)}"
-                if len(impacts) > 5:
-                    detail += f" (+{len(impacts) - 5} more)"
-            summaries.append(detail)
-
-        return (
-            f"Found {len(concepts)} economic concept(s) matching '{query}': "
-            f"{'; '.join(summaries)}."
-        )
-    except Exception as e:
-        return f"Error searching macro data for '{query}': {e}"
-
-
-def get_entity_properties(entity_name: str, neid: str) -> str:
-    """Fetch all properties for an entity.
-
-    Args:
-        entity_name: Display name of the entity.
-        neid: The 20-digit entity ID.
-
-    Returns:
-        Summary of properties found (count, property names).
-    """
-    global _active_session_id
-    _load_schema()
-    sid, session = _get_session(_active_session_id)
-    _active_session_id = sid
-    bucket = _ensure_entity(session, entity_name, neid)
-
-    try:
-        values = _fetch_properties([neid], include_attrs=True)
-
-        bucket.setdefault("properties", []).extend(values)
-
-        unique_pids = list({v.get("pid") for v in values})
-        prop_names = sorted({_pname(pid) for pid in unique_pids if _pname(pid)})[:15]
-
-        return (
-            f"Found {len(values)} property value(s) for '{entity_name}' "
-            f"across {len(unique_pids)} unique properties. "
-            f"Properties: {', '.join(prop_names) if prop_names else '(PIDs not in schema)'}."
-        )
-    except Exception as e:
-        return f"Error fetching properties for '{entity_name}': {e}"
-
-
-def record_result(entity_name: str = "", data_type: str = "all") -> str:
-    """Promote staged exploration data into the final research output.
-
-    Call this after exploring data to mark specific results as important
-    for the downstream analysis.
-
-    Args:
-        entity_name: Entity name (for entity data) or macro query string
-            (when data_type is "macro").
-        data_type: What to record. Options:
-            - "all": everything staged for this entity
-            - "news", "stock_prices", "filings", "events", "relationships",
-              "properties", "financial_fundamentals", "ticker": specific
-              entity data category
-            - "macro": macro/economic concept data (entity_name is the
-              query string)
-
-    Returns:
-        Confirmation of what was recorded.
-    """
-    global _active_session_id
-    if not _active_session_id or _active_session_id not in _sessions:
-        return "No active research session."
-
-    session = _sessions[_active_session_id]
-
-    if data_type == "macro":
-        staged = session["macro_data"].get(entity_name)
-        if not staged:
-            return f"No staged macro data for query '{entity_name}'."
-        import copy
-        session["recorded_macro_data"][entity_name] = copy.deepcopy(staged)
-        count = len(staged) if isinstance(staged, list) else 1
-        return f"Recorded macro data for '{entity_name}' ({count} concept(s))."
-
-    staged_entity = session["entity_data"].get(entity_name)
-    if not staged_entity:
-        return f"No staged data for entity '{entity_name}'."
-
-    import copy
-    recorded = session["recorded_entity_data"]
-    if entity_name not in recorded:
-        recorded[entity_name] = {"neid": staged_entity.get("neid", "")}
-
-    if data_type == "all":
-        recorded[entity_name] = copy.deepcopy(staged_entity)
-        keys = [k for k in staged_entity if k != "neid"]
-        return f"Recorded all data for '{entity_name}': {', '.join(keys)}."
-
-    value = staged_entity.get(data_type)
-    if value is None:
-        return f"No staged '{data_type}' data for entity '{entity_name}'."
-
-    recorded[entity_name][data_type] = copy.deepcopy(value)
-    if isinstance(value, list):
-        return f"Recorded {data_type} for '{entity_name}' ({len(value)} item(s))."
-    return f"Recorded {data_type} for '{entity_name}'."
-
-
-def finalize_research() -> str:
-    """Return the final research JSON.
-
-    The output contains two sections:
-    - ``research``: only the data explicitly promoted via ``record_result``.
-      This is what the downstream report agent uses.
-    - ``show_your_work``: the full staged exploration data — every API call
-      the agent made, whether recorded or not.
-
-    Returns:
-        The research JSON as a string.
-    """
-    global _active_session_id
-    if not _active_session_id or _active_session_id not in _sessions:
-        return json.dumps({"error": "No active research session"})
-
-    session = _sessions[_active_session_id]
-    result = json.dumps(
-        {
-            "research": {
-                "entity_data": session["recorded_entity_data"],
-                "macro_data": session["recorded_macro_data"],
-            },
-            "show_your_work": {
-                "entity_data": session["entity_data"],
-                "macro_data": session["macro_data"],
-            },
-        },
-        default=str,
-    )
-
-    del _sessions[_active_session_id]
-    _active_session_id = None
-
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 def _fetch_properties(
     eids: list[str], include_attrs: bool = False, timeout: float = 30.0
@@ -661,11 +102,7 @@ def _fetch_properties(
 def _fetch_properties_batched(
     eids: list[str], include_attrs: bool = False, timeout: float = 10.0, batch_size: int = 5
 ) -> list[dict]:
-    """Fetch properties in small batches to avoid timeouts on mega-entities.
-
-    If a batch times out, individual entities in that batch are tried one
-    at a time so a single problematic entity doesn't block the rest.
-    """
+    """Fetch properties in small batches to avoid timeouts on mega-entities."""
     all_values: list[dict] = []
     for i in range(0, len(eids), batch_size):
         batch = eids[i : i + batch_size]
@@ -691,12 +128,7 @@ def _extract_ticker(values: list[dict]) -> str | None:
 
 
 def _find_financial_instrument(ticker: str) -> str | None:
-    """Search for a financial_instrument entity by ticker symbol.
-
-    Prefers entities whose name exactly matches the ticker (these are the
-    stocks-source entities with actual OHLCV data, as opposed to the larger
-    13F-HR merged entities named like "Company Inc.").
-    """
+    """Search for a financial_instrument entity by ticker symbol."""
     try:
         resp = elemental_client.post(
             "/entities/search",
@@ -724,12 +156,7 @@ def _find_financial_instrument(ticker: str) -> str | None:
 
 
 def _find_organization(name: str) -> str | None:
-    """Search for an organization entity by name.
-
-    Tries both the raw name and with common corporate suffixes to improve
-    resolution accuracy (e.g. "Netflix" alone may match subsidiaries before
-    the parent, while "Netflix Inc" matches the parent directly).
-    """
+    """Search for an organization entity by name."""
     candidates = [name]
     lower = name.lower().rstrip(".")
     if not any(s in lower for s in ("inc", "corp", "ltd", "llc", "co.", "company")):
@@ -759,12 +186,7 @@ def _find_organization(name: str) -> str | None:
 
 
 def _find_organization_with_data(name: str) -> str | None:
-    """Search for an organization entity that has EDGAR/financial data.
-
-    Prefers organizations with properties like ticker/CIK (EDGAR-sourced)
-    over NLP-sourced organizations that only have relationship properties.
-    Returns up to 3 candidates and probes each briefly for financial data.
-    """
+    """Search for an organization entity that has EDGAR/financial data."""
     candidates = [name]
     lower = name.lower().rstrip(".")
     if not any(s in lower for s in ("inc", "corp", "ltd", "llc", "co.", "company")):
@@ -835,6 +257,11 @@ def _get_ticker_for_entity(neid: str) -> str | None:
     except Exception:
         pass
     return None
+
+
+# ---------------------------------------------------------------------------
+# Extraction helpers
+# ---------------------------------------------------------------------------
 
 
 def _extract_fundamentals(values: list[dict]) -> dict:
@@ -1045,80 +472,617 @@ def _extract_events(values: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Executor functions — each returns (summary: str, full_data: dict)
+# ---------------------------------------------------------------------------
+
+
+def _exec_get_news(entity_name: str, neid: str) -> tuple[str, dict]:
+    """Fetch news. Returns (summary_string, full articles dict)."""
+    _load_schema()
+
+    try:
+        linked_expr = json.dumps({
+            "type": "linked",
+            "linked": {"to_entity": neid, "distance": 1, "direction": "both"},
+        })
+        resp = elemental_client.post(
+            "/elemental/find",
+            data={"expression": linked_expr, "limit": "30"},
+        )
+        resp.raise_for_status()
+        eids = resp.json().get("eids", [])
+        if not eids:
+            return f"No linked entities found for '{entity_name}'.", {}
+
+        values = _fetch_properties_batched(eids[:20], timeout=10.0)
+        articles = _extract_news(values)
+
+        if not articles:
+            return f"No news articles found for '{entity_name}'.", {}
+
+        sentiments = [a["sentiment"] for a in articles if a.get("sentiment") is not None]
+        dates = [a["date"] for a in articles if a.get("date")]
+        avg_sent = round(sum(sentiments) / len(sentiments), 2) if sentiments else None
+        date_range = f"{min(dates)} to {max(dates)}" if dates else "unknown"
+
+        parts = [f"Found {len(articles)} news article(s) for '{entity_name}'."]
+        parts.append(f"Date range: {date_range}.")
+        if avg_sent is not None:
+            parts.append(f"Average sentiment: {avg_sent} ({len(sentiments)} scored).")
+        return " ".join(parts), {"articles": articles}
+    except Exception as e:
+        return f"Error fetching news for '{entity_name}': {e}", {}
+
+
+def _exec_get_stock_prices(entity_name: str, neid: str) -> tuple[str, dict]:
+    """Fetch OHLCV data or financial fundamentals."""
+    _load_schema()
+
+    prices: list[dict] = []
+    ticker = None
+    fundamentals: dict = {}
+
+    try:
+        values = _fetch_properties([neid], timeout=15.0)
+        prices = _extract_prices(values)
+        ticker = _extract_ticker(values)
+    except Exception:
+        pass
+
+    if not prices:
+        if not ticker:
+            ticker = _get_ticker_for_entity(neid)
+        fi_neid = None
+        if ticker:
+            fi_neid = _find_financial_instrument(ticker)
+        if not fi_neid:
+            fi_neid = _find_financial_instrument(entity_name)
+        if fi_neid and fi_neid != neid:
+            try:
+                values2 = _fetch_properties([fi_neid], timeout=15.0)
+                prices = _extract_prices(values2)
+                if not ticker:
+                    ticker = _extract_ticker(values2)
+            except Exception:
+                pass
+
+    if not prices:
+        org_neid = _find_organization_with_data(entity_name)
+        if org_neid:
+            try:
+                values3 = _fetch_properties([org_neid], timeout=15.0)
+                fundamentals = _extract_fundamentals(values3)
+                if not ticker:
+                    ticker = _extract_ticker(values3)
+            except Exception:
+                pass
+
+    if not prices and not fundamentals:
+        return f"No stock price data found for '{entity_name}'.", {}
+
+    full_data: dict = {}
+    parts = []
+
+    if ticker:
+        full_data["ticker"] = ticker
+    if prices:
+        full_data["prices"] = prices
+        dates = [p["date"] for p in prices if p.get("date")]
+        closes = [p["close"] for p in prices if p.get("close") is not None]
+        date_range = f"{min(dates)} to {max(dates)}" if dates else "unknown"
+        price_range = f"${min(closes):.2f} – ${max(closes):.2f}" if closes else "unknown"
+        parts.append(
+            f"Found {len(prices)} OHLCV data point(s) for '{entity_name}'"
+            + (f" (ticker: {ticker})" if ticker else "")
+            + f". Date range: {date_range}. Close price range: {price_range}."
+        )
+    if fundamentals:
+        full_data["fundamentals"] = fundamentals
+        parts.append(
+            f"Financial fundamentals: revenue=${fundamentals.get('total_revenue', '?')}, "
+            f"net_income=${fundamentals.get('net_income', '?')}, "
+            f"shares_outstanding={fundamentals.get('shares_outstanding', '?')}."
+        )
+
+    return " ".join(parts), full_data
+
+
+def _exec_get_filings(entity_name: str, neid: str) -> tuple[str, dict]:
+    """Fetch SEC filings."""
+    _load_schema()
+
+    try:
+        linked_expr = json.dumps({
+            "type": "linked",
+            "linked": {"to_entity": neid, "distance": 1, "direction": "incoming"},
+        })
+        resp = elemental_client.post(
+            "/elemental/find",
+            data={"expression": linked_expr, "limit": "30"},
+        )
+        resp.raise_for_status()
+        eids = resp.json().get("eids", [])
+        if not eids:
+            return f"No filings found for '{entity_name}'.", {}
+
+        values = _fetch_properties_batched(eids[:20], timeout=10.0)
+        filings = _extract_filings(values)
+
+        if not filings:
+            return f"No SEC filing data found for '{entity_name}'.", {}
+
+        form_types = list({f.get("form_type", "?") for f in filings})
+        dates = [f["date"] for f in filings if f.get("date")]
+        date_range = f"{min(dates)} to {max(dates)}" if dates else "unknown"
+
+        return (
+            f"Found {len(filings)} filing(s) for '{entity_name}'. "
+            f"Form types: {', '.join(form_types)}. Date range: {date_range}."
+        ), {"filings": filings}
+    except Exception as e:
+        return f"Error fetching filings for '{entity_name}': {e}", {}
+
+
+def _exec_get_events(entity_name: str, neid: str) -> tuple[str, dict]:
+    """Fetch events."""
+    _load_schema()
+
+    try:
+        linked_expr = json.dumps({
+            "type": "linked",
+            "linked": {"to_entity": neid, "distance": 1, "direction": "incoming"},
+        })
+        resp = elemental_client.post(
+            "/elemental/find",
+            data={"expression": linked_expr, "limit": "30"},
+        )
+        resp.raise_for_status()
+        eids = resp.json().get("eids", [])
+        if not eids:
+            return f"No events found for '{entity_name}'.", {}
+
+        values = _fetch_properties_batched(eids[:20], timeout=10.0)
+        events = _extract_events(values)
+
+        if not events:
+            return f"No event data found for '{entity_name}'.", {}
+
+        categories = list({e.get("category", "?") for e in events})
+        return (
+            f"Found {len(events)} event(s) for '{entity_name}'. "
+            f"Categories: {', '.join(categories)}."
+        ), {"events": events}
+    except Exception as e:
+        return f"Error fetching events for '{entity_name}': {e}", {}
+
+
+def _exec_get_relationships(entity_name: str, neid: str) -> tuple[str, dict]:
+    """Fetch related entities."""
+    try:
+        linked_expr = json.dumps({
+            "type": "linked",
+            "linked": {"to_entity": neid, "distance": 1, "direction": "both"},
+        })
+        resp = elemental_client.post(
+            "/elemental/find",
+            data={"expression": linked_expr, "limit": "50"},
+        )
+        resp.raise_for_status()
+        eids = resp.json().get("eids", [])
+        if not eids:
+            return f"No related entities found for '{entity_name}'.", {}
+
+        names_resp = elemental_client.post(
+            "/entities/names",
+            json={"neids": eids[:30]},
+            timeout=10.0,
+        )
+        names_resp.raise_for_status()
+        names_map = names_resp.json().get("results", {})
+
+        relationships = []
+        for eid in eids[:30]:
+            name = names_map.get(eid, eid)
+            relationships.append({"neid": eid, "name": name})
+
+        related_names = [r["name"] for r in relationships[:10]]
+        remaining = len(relationships) - 10 if len(relationships) > 10 else 0
+        summary = ", ".join(related_names)
+        if remaining:
+            summary += f", and {remaining} more"
+
+        return (
+            f"Found {len(relationships)} related entities for '{entity_name}': {summary}."
+        ), {"relationships": relationships}
+    except Exception as e:
+        return f"Error fetching relationships for '{entity_name}': {e}", {}
+
+
+def _exec_get_entity_properties(entity_name: str, neid: str) -> tuple[str, dict]:
+    """Fetch all properties for an entity."""
+    _load_schema()
+
+    try:
+        values = _fetch_properties([neid], include_attrs=True)
+        unique_pids = list({v.get("pid") for v in values})
+        prop_names = sorted({_pname(pid) for pid in unique_pids if _pname(pid)})[:15]
+
+        return (
+            f"Found {len(values)} property value(s) for '{entity_name}' "
+            f"across {len(unique_pids)} unique properties. "
+            f"Properties: {', '.join(prop_names) if prop_names else '(PIDs not in schema)'}."
+        ), {"properties": values, "property_names": prop_names}
+    except Exception as e:
+        return f"Error fetching properties for '{entity_name}': {e}", {}
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------------
+
+_EXECUTORS = {
+    "get_news": _exec_get_news,
+    "get_stock_prices": _exec_get_stock_prices,
+    "get_filings": _exec_get_filings,
+    "get_events": _exec_get_events,
+    "get_relationships": _exec_get_relationships,
+    "get_entity_properties": _exec_get_entity_properties,
+}
+
+
+_REQUIRED_PARAMS: dict[str, list[str]] = {
+    "get_news": ["entity_name", "neid"],
+    "get_stock_prices": ["entity_name", "neid"],
+    "get_filings": ["entity_name", "neid"],
+    "get_events": ["entity_name", "neid"],
+    "get_relationships": ["entity_name", "neid"],
+    "get_entity_properties": ["entity_name", "neid"],
+}
+
+
+def _dispatch_call(call: dict) -> tuple[str, dict]:
+    """Execute a single API call spec. Returns (summary, full_data)."""
+    call_type = call.get("type", "")
+    executor = _EXECUTORS.get(call_type)
+    if not executor:
+        return f"Unknown call type: {call_type}", {}
+    params = call.get("params", {})
+    required = _REQUIRED_PARAMS.get(call_type, [])
+    missing = [p for p in required if not params.get(p)]
+    if missing:
+        return (
+            f"Missing required parameter(s) {missing} for {call_type}. "
+            f"All calls require entity_name and neid from query.entities.",
+            {},
+        )
+    try:
+        return executor(**params)
+    except Exception as e:
+        return f"Error: {e}", {}
+
+
+# ---------------------------------------------------------------------------
+# Abridger — keeps research doc within LLM context budget
+# ---------------------------------------------------------------------------
+
+_MAX_DOC_SIZE = 100_000
+_MAX_PER_RESULT = 10_000
+
+
+def _abridge_value(value: any, budget: int) -> any:
+    """Truncate a value to fit within budget characters."""
+    if isinstance(value, str):
+        if len(value) <= budget:
+            return value
+        return value[: budget - 12] + " [truncated]"
+
+    if isinstance(value, list):
+        serialized = json.dumps(value, default=str)
+        if len(serialized) <= budget:
+            return value
+        kept = []
+        running = 2  # for []
+        for item in value:
+            item_str = json.dumps(item, default=str)
+            if running + len(item_str) + 2 > budget - 40:
+                remaining = len(value) - len(kept)
+                kept.append(f"... and {remaining} more items")
+                break
+            kept.append(item)
+            running += len(item_str) + 2
+        return kept
+
+    if isinstance(value, dict):
+        serialized = json.dumps(value, default=str)
+        if len(serialized) <= budget:
+            return value
+        result = {}
+        for k, v in value.items():
+            per_key = max(50, budget // max(len(value), 1))
+            result[k] = _abridge_value(v, per_key)
+        return result
+
+    return value
+
+
+def _abridge_research_doc(doc: dict, max_total: int = _MAX_DOC_SIZE) -> str:
+    """Serialize research doc, truncating call results to fit budget."""
+    query_json = json.dumps(doc.get("query", {}), default=str)
+    overhead = len(query_json) + 200
+    available = max_total - overhead
+
+    calls = doc.get("calls", [])
+    if not calls:
+        return json.dumps(doc, default=str)
+
+    per_result = min(_MAX_PER_RESULT, available // max(len(calls), 1))
+
+    abridged_calls = []
+    for call in calls:
+        result_str = call.get("result", "")
+        abridged = _abridge_value(result_str, per_result)
+        abridged_calls.append({**call, "result": abridged})
+
+    return json.dumps(
+        {"query": doc.get("query", {}), "calls": abridged_calls}, default=str
+    )
+
+
+# ---------------------------------------------------------------------------
+# Planner LLM — calls Gemini directly for structured planning
+# ---------------------------------------------------------------------------
+
+PLANNER_INSTRUCTION = """\
+You are the planning component of a financial research system. You operate in a loop:
+
+1. You receive a JSON document containing a `query` (thesis, entities, claims, data_needs)
+   and a list of `calls` already made with their results.
+2. You decide what API calls to make next, OR declare research complete.
+
+## Response format
+
+Return a JSON object with one of these two structures:
+
+### Request more data:
+{
+    "action": "research",
+    "reasoning": "Brief explanation of what you need and why",
+    "calls": [
+        {"type": "get_news", "params": {"entity_name": "Netflix", "neid": "07456007231444618110"}},
+        {"type": "get_stock_prices", "params": {"entity_name": "Disney", "neid": "..."}}
+    ]
+}
+
+### Research complete:
+{
+    "action": "done",
+    "reasoning": "Brief explanation of why you have enough data"
+}
+
+## Available API calls
+
+### get_news(entity_name, neid)
+Fetches recent news articles linked to the entity. Returns article count, date range,
+average sentiment score (-1 to 1), and per-article data (title, date, sentiment, source,
+tone). Use for sentiment context, recent developments, or market reaction.
+Typically returns 5-20 articles.
+
+### get_stock_prices(entity_name, neid)
+Fetches OHLCV stock price history or financial fundamentals. For most companies returns
+daily price data (open/high/low/close/volume) with date ranges and ticker symbol. For very
+large entities (mega-cap stocks), OHLCV may time out and fall back to financial fundamentals
+(revenue, net income, EPS, shares outstanding) from SEC filings.
+Always returns ticker when available. Use for any price-related or valuation claim.
+
+### get_filings(entity_name, neid)
+Fetches SEC filings: 10-K, 10-Q, 8-K, Form 4, SC 13G, etc. Returns form type, filing date,
+accession number, description. For Form 4 (insider trading), also returns transaction type
+and shares transacted. Use for corporate governance, insider activity, or financial reporting.
+
+### get_events(entity_name, neid)
+Fetches corporate events: mergers & acquisitions, product launches, lawsuits, leadership
+changes, regulatory actions, analyst reports. Returns event category, description, date,
+likelihood. Use for catalysts, corporate actions, or market-moving events.
+
+### get_relationships(entity_name, neid)
+Discovers entities linked to the given entity (competitors, subsidiaries, investors,
+partners). Returns a list of related entity names and NEIDs. Use to find additional
+entities worth investigating — e.g. find competitors for industry-trend theses.
+
+### get_entity_properties(entity_name, neid)
+Raw property dump for an entity. Returns property count and names (e.g. ticker,
+company_cik, industry, sector). Use as diagnostic/exploration when other calls don't
+return expected data, or to understand what data is available for an unfamiliar entity.
+
+## Strategy
+
+- **Start broad**: First iteration should cover all entities with their primary data needs
+  (news + stock prices for most financial theses).
+- **Use `data_needs`**: The query rewrite identified relevant categories. Cover all of them.
+- **Batch calls**: Request multiple calls per iteration. Don't request one at a time.
+- **Follow up on thin results**: If a call returns 0 results or errors, try
+  `get_relationships` to find related entities, or `get_entity_properties` to understand
+  what exists.
+- **NEIDs are mandatory**: Every call requires both `entity_name` and `neid`. You can
+  ONLY use NEIDs from `query.entities`. Never omit the `neid` param, never fabricate one.
+  If an entity isn't in the query, you cannot fetch data for it directly — use
+  `get_relationships` on a known entity to discover related NEIDs first.
+- **Don't over-fetch**: 3-4 iterations is typical. If you have news, prices, and events
+  for all entities in the query, that's usually enough.
+- **Error handling**: If a call errors, note it and move on. Never retry the exact same
+  call with the same params — it will fail the same way. If multiple calls fail for the
+  same entity (e.g. invalid NEID, 400 errors), that entity's data is unavailable — do
+  NOT keep retrying.
+- **Know when to stop**: If you've collected data for all entities that have valid NEIDs
+  and further calls keep failing, say "done" with what you have. The report agent can work
+  with partial data. Spinning on unresolvable errors wastes iterations.
+- **Say "done"** when you have sufficient evidence to address every claim in the thesis,
+  or after exhausting useful avenues.
+"""
+
+
+def _load_broadchurch_config() -> dict:
+    """Load broadchurch.yaml for GCP project info."""
+    from pathlib import Path
+
+    import yaml
+
+    for candidate in [
+        Path("broadchurch.yaml"),
+        Path(__file__).parent / "broadchurch.yaml",
+    ]:
+        if candidate.exists():
+            with open(candidate) as f:
+                return yaml.safe_load(f) or {}
+    return {}
+
+
+def _call_planner_llm(research_doc_json: str) -> dict:
+    """Call Gemini to get the next research plan."""
+    from google import genai
+    from google.genai import types
+
+    config = _load_broadchurch_config()
+    project = config.get("gcp", {}).get("project", "broadchurch")
+    region = config.get("gcp", {}).get("region", "us-central1")
+
+    client = genai.Client(vertexai=True, project=project, location=region)
+    response = client.models.generate_content(
+        model="gemini-2.0-flash",
+        contents=research_doc_json,
+        config=types.GenerateContentConfig(
+            system_instruction=PLANNER_INSTRUCTION,
+            response_mime_type="application/json",
+            temperature=0.2,
+        ),
+    )
+    return json.loads(response.text)
+
+
+# ---------------------------------------------------------------------------
+# Research iteration — the single ADK tool that drives the loop
+# ---------------------------------------------------------------------------
+
+_research_doc: dict | None = None
+_full_results: dict = {}
+_call_counter: int = 0
+_iteration_counter: int = 0
+MAX_ITERATIONS = 10
+
+
+def research_iteration(input_json: str = "") -> str:
+    """Run one iteration of the research loop.
+
+    First call: provide the query rewrite JSON as input_json.
+    Subsequent calls: leave input_json empty (state is internal).
+
+    Returns JSON describing what happened this iteration. When the planner
+    decides research is complete, includes the full final output.
+
+    Args:
+        input_json: Query rewrite JSON on first call, empty on subsequent calls.
+
+    Returns:
+        JSON string with iteration results or final output.
+    """
+    global _research_doc, _full_results, _call_counter, _iteration_counter
+    _load_schema()
+
+    if _research_doc is None:
+        query_input = json.loads(input_json) if input_json else {}
+        _research_doc = {"query": query_input, "calls": []}
+        _full_results = {}
+        _call_counter = 0
+        _iteration_counter = 0
+
+    _iteration_counter += 1
+
+    if _iteration_counter > MAX_ITERATIONS:
+        result = _build_final_result("Maximum iterations reached.")
+        _reset_state()
+        return json.dumps(result, default=str)
+
+    prompt = _abridge_research_doc(_research_doc)
+    try:
+        plan = _call_planner_llm(prompt)
+    except Exception as e:
+        result = _build_final_result(f"Planner error: {e}")
+        _reset_state()
+        return json.dumps(result, default=str)
+
+    if plan.get("action") == "done":
+        result = _build_final_result(plan.get("reasoning", "Research complete."))
+        _reset_state()
+        return json.dumps(result, default=str)
+
+    calls_made = []
+    for call_spec in plan.get("calls", []):
+        _call_counter += 1
+        call_id = _call_counter
+        summary, data = _dispatch_call(call_spec)
+        call_record = {
+            "id": call_id,
+            "type": call_spec["type"],
+            "params": call_spec.get("params", {}),
+            "status": "ok" if data else "error",
+            "result": summary,
+        }
+        _research_doc["calls"].append(call_record)
+        _full_results[call_id] = data
+        calls_made.append(call_record)
+
+    return json.dumps(
+        {
+            "status": "continue",
+            "iteration": _iteration_counter,
+            "reasoning": plan.get("reasoning", ""),
+            "calls_made": calls_made,
+        },
+        default=str,
+    )
+
+
+def _build_final_result(reasoning: str) -> dict:
+    """Build the final output with both research doc and full show_your_work."""
+    return {
+        "status": "done",
+        "iteration": _iteration_counter,
+        "reasoning": reasoning,
+        "calls_made": [],
+        "final": {
+            "research": _research_doc,
+            "show_your_work": _full_results,
+        },
+    }
+
+
+def _reset_state() -> None:
+    """Reset module-level state after research completes."""
+    global _research_doc, _full_results, _call_counter, _iteration_counter
+    _research_doc = None
+    _full_results = {}
+    _call_counter = 0
+    _iteration_counter = 0
+
+
+# ---------------------------------------------------------------------------
 # Agent definition
 # ---------------------------------------------------------------------------
 
-INSTRUCTION = """\
-You are a financial data researcher. Your job is to gather data relevant to
-a financial thesis by calling the available research tools.
+WRAPPER_INSTRUCTION = """\
+You are a research orchestrator. You receive a research query as JSON.
 
-You work in two phases: **Explore**, then **Record**.
+1. Call research_iteration(input_json=<the user message>) to start.
+2. If the response status is "continue", call research_iteration() again
+   (no arguments — state is internal).
+3. Repeat until the response status is "done".
 
-## Input
-
-You are given a finalized QueryRewrite JSON containing:
-- `thesis_plaintext`: the user's thesis
-- `entities`: list of resolved entities, each with `name`, `neid`, and `type`
-- `claims`: testable claims to investigate
-- `data_needs`: categories of data to fetch (news, stock_prices, filings, etc.)
-- Optionally `macro_indicators`: macroeconomic concepts with search queries
-
-## Phase 1: Explore
-
-Call any research tool as many times as you like. Every call fetches data
-and returns a summary, but the data is only **staged** internally — it will
-NOT appear in the final output unless you explicitly record it.
-
-Use this phase to understand the data landscape:
-- Fetch news, stock prices, filings, events, and macro data for each entity.
-- Follow relationships to discover related entities.
-- Call tools on related entities if the data seems relevant.
-- If a tool call fails, try once more. If it still fails, move on.
-
-## Phase 2: Record
-
-Once you have explored enough to know which data is relevant to the thesis
-and its claims, call `record_result` to promote that data into the final
-research output.
-
-- `record_result(entity_name, data_type)` — record a specific category
-  (e.g. "news", "stock_prices", "filings", "events", "relationships",
-  "financial_fundamentals", "ticker") for an entity.
-- `record_result(entity_name, "all")` — record everything for an entity.
-- `record_result(query, "macro")` — record a macro/economic concept result.
-
-Only record data that is relevant to evaluating the thesis. Not everything
-you explored needs to be recorded — be selective.
-
-## Phase 3: Finalize
-
-When done, call `finalize_research()`. This returns JSON with two sections:
-- `research`: only the data you explicitly recorded (used by the report).
-- `show_your_work`: everything you explored (shown to the user for
-  transparency).
-
-## Rules
-
-- Explore broadly first, then record selectively.
-- Do NOT fabricate data. You can only read tool summaries.
-- You MUST call `record_result` for at least the key data before finalizing.
-- You MUST call `finalize_research()` when done — this is mandatory.
-- Do NOT write a report or analysis. Just gather and curate data.
+Do NOT modify the input. Do NOT add commentary. Just call the tool.
 """
 
 root_agent = Agent(
     model="gemini-2.0-flash",
     name="researcher",
-    instruction=INSTRUCTION,
-    tools=[
-        get_news,
-        get_stock_prices,
-        get_filings,
-        get_events,
-        get_relationships,
-        get_macro,
-        get_entity_properties,
-        record_result,
-        finalize_research,
-    ],
+    instruction=WRAPPER_INSTRUCTION,
+    tools=[research_iteration],
 )

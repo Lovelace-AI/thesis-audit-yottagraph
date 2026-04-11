@@ -24,15 +24,9 @@ export interface QueryEntity {
     user_correction?: string;
 }
 
-export interface MacroIndicator {
-    type: 'macro';
-    search_query: string;
-}
-
 export interface QueryRewrite {
     thesis_plaintext: string;
     entities: QueryEntity[];
-    macro_indicators: MacroIndicator[];
     claims: string[];
     data_needs: string[];
 }
@@ -43,24 +37,33 @@ export interface QueryRewrite {
 
 export interface ReportResult {
     query: QueryRewrite;
-    entity_data: Record<string, any>;
-    macro_data: Record<string, any>;
+    calls: any[];
+    show_your_work: Record<string, any>;
     supporting_argument: string;
     contradicting_argument: string;
     final_analysis: string;
 }
 
 // ---------------------------------------------------------------------------
-// Types — Research progress tracking
+// Types — Research progress tracking (nested iteration model)
 // ---------------------------------------------------------------------------
 
-export interface ResearchStep {
-    id: string;
-    tool: string;
-    args: Record<string, any>;
+export interface ResearchCallResult {
+    id: number;
+    type: string;
+    params: Record<string, any>;
     label: string;
+    status: 'ok' | 'error';
+    summary: string;
+}
+
+export interface ResearchIteration {
+    id: string;
+    iteration: number;
+    reasoning: string;
     timestamp: number;
-    response?: string;
+    status: 'planning' | 'executing' | 'done';
+    calls: ResearchCallResult[];
 }
 
 export interface EntitySelection {
@@ -89,14 +92,12 @@ const TOOL_LABELS: Record<string, (args: Record<string, any>) => string> = {
     get_filings: (a) => `Searching filings for ${a.entity_name || '?'}...`,
     get_events: (a) => `Finding events for ${a.entity_name || '?'}...`,
     get_relationships: (a) => `Exploring relationships for ${a.entity_name || '?'}...`,
-    get_macro: (a) => `Searching macro data: "${a.query || '?'}"...`,
     get_entity_properties: (a) => `Getting properties for ${a.entity_name || '?'}...`,
-    finalize_research: () => 'Finalizing research data...',
 };
 
-function toolLabel(name: string, args: Record<string, any>): string {
-    const fn = TOOL_LABELS[name];
-    return fn ? fn(args) : `Running ${name}...`;
+function callLabel(type: string, params: Record<string, any>): string {
+    const fn = TOOL_LABELS[type];
+    return fn ? fn(params) : `Running ${type}...`;
 }
 
 // ---------------------------------------------------------------------------
@@ -109,7 +110,7 @@ export function useThesisResearch() {
     const thesis = ref('');
     const status = ref<ResearchStatus>('idle');
     const queryRewrite = ref<QueryRewrite | null>(null);
-    const progress = ref<ResearchStep[]>([]);
+    const progress = ref<ResearchIteration[]>([]);
     const report = ref<ReportResult | null>(null);
     const rawFallback = ref<string | null>(null);
     const error = ref<string | null>(null);
@@ -185,7 +186,7 @@ export function useThesisResearch() {
         agentKey: 'queryRewrite' | 'researcher' | 'report',
         message: string,
         opts?: { trackProgress?: boolean }
-    ): Promise<{ text: string; finalizeData?: string }> {
+    ): Promise<{ text: string; researchData?: any }> {
         const gatewayUrl = getGatewayUrl();
         const orgId = getTenantOrgId();
         await resolveAgents();
@@ -210,7 +211,7 @@ export function useThesisResearch() {
         }
 
         let finalText = '';
-        let finalizeData: string | undefined;
+        let researchData: any = undefined;
 
         const portalStreamUrl = `${gatewayUrl}/api/agents/${orgId}/${engineId}/stream`;
         const portalQueryUrl = `${gatewayUrl}/api/agents/${orgId}/${engineId}/query`;
@@ -221,35 +222,55 @@ export function useThesisResearch() {
             for await (const { event, data } of readSSE(response)) {
                 if (event === 'function_call') {
                     lastCallName = data.name || '?';
-                    if (opts?.trackProgress) {
-                        const step: ResearchStep = {
+                    if (opts?.trackProgress && lastCallName === 'research_iteration') {
+                        const iteration: ResearchIteration = {
                             id: crypto.randomUUID(),
-                            tool: lastCallName,
-                            args: data.args || {},
-                            label: toolLabel(lastCallName, data.args || {}),
+                            iteration: progress.value.length + 1,
+                            reasoning: '',
                             timestamp: Date.now(),
+                            status: 'planning',
+                            calls: [],
                         };
-                        progress.value = [...progress.value, step];
+                        progress.value = [...progress.value, iteration];
                     }
                 } else if (event === 'function_response') {
                     const respName = data.name || lastCallName;
-                    const respText =
-                        typeof data.response === 'string'
-                            ? data.response
-                            : JSON.stringify(data.response, null, 2);
 
-                    // Capture finalize_research response — this is the full accumulated JSON
-                    if (respName === 'finalize_research') {
-                        finalizeData = respText;
-                    }
+                    if (respName === 'research_iteration' && opts?.trackProgress) {
+                        const respText =
+                            typeof data.response === 'string'
+                                ? data.response
+                                : JSON.stringify(data.response);
+                        let parsed: any = null;
+                        try {
+                            parsed =
+                                typeof data.response === 'object'
+                                    ? data.response
+                                    : JSON.parse(respText);
+                        } catch {
+                            // unparseable
+                        }
 
-                    if (opts?.trackProgress) {
-                        const steps = progress.value;
-                        for (let i = steps.length - 1; i >= 0; i--) {
-                            if (steps[i].tool === respName && !steps[i].response) {
-                                steps[i] = { ...steps[i], response: respText };
-                                progress.value = [...steps];
-                                break;
+                        if (parsed) {
+                            // Update the latest iteration with results
+                            const iterations = [...progress.value];
+                            const latest = iterations[iterations.length - 1];
+                            if (latest) {
+                                latest.reasoning = parsed.reasoning || '';
+                                latest.status = 'done';
+                                latest.calls = (parsed.calls_made || []).map((c: any) => ({
+                                    id: c.id,
+                                    type: c.type,
+                                    params: c.params || {},
+                                    label: callLabel(c.type, c.params || {}),
+                                    status: c.status || 'ok',
+                                    summary: c.result || '',
+                                }));
+                                progress.value = iterations;
+                            }
+
+                            if (parsed.status === 'done' && parsed.final) {
+                                researchData = parsed.final;
                             }
                         }
                     }
@@ -275,7 +296,7 @@ export function useThesisResearch() {
             });
             if (portalResp.ok && portalResp.body) {
                 const result = await processSSE(portalResp);
-                if (result !== null) return { text: result, finalizeData };
+                if (result !== null) return { text: result, researchData };
             }
         } catch {
             // Portal stream unavailable
@@ -317,7 +338,6 @@ export function useThesisResearch() {
         const parsed = tryParseJSON(toParse);
         if (parsed) return parsed;
 
-        // Try extracting a JSON object from within the text
         const braceMatch = text.match(/\{[\s\S]*\}/);
         if (braceMatch) {
             return tryParseJSON(braceMatch[0]);
@@ -370,27 +390,21 @@ export function useThesisResearch() {
         sessionIds.value = { queryRewrite: null, researcher: null, report: null };
 
         try {
-            // Build initial QueryRewrite
             const qr: QueryRewrite = {
                 thesis_plaintext: thesisText,
                 entities: [],
-                macro_indicators: [],
                 claims: [],
                 data_needs: [],
             };
 
-            // Ask the Query Rewrite Agent to extract entities
             const agentResponse = await runQueryRewrite(qr);
             if (!agentResponse) {
                 throw new Error('Query Rewrite Agent returned unparseable response.');
             }
 
-            // Update the QueryRewrite with agent's output
             qr.claims = agentResponse.claims || [];
             qr.data_needs = agentResponse.data_needs || [];
-            qr.macro_indicators = agentResponse.macro_indicators || [];
 
-            // Resolve candidate entities
             const candidateNames: string[] = agentResponse.candidate_entities || [];
             if (candidateNames.length > 0) {
                 status.value = 'resolving';
@@ -421,13 +435,11 @@ export function useThesisResearch() {
         const qr = { ...queryRewrite.value };
         const unresolvedRemain: string[] = [];
 
-        // Apply user selections to the QueryRewrite
         qr.entities = qr.entities.map((entity, idx) => {
             const sel = selections[idx];
             if (!sel) return entity;
 
             if (sel.neid) {
-                // User confirmed a candidate
                 const candidate = entity.candidates?.find((c) => c.neid === sel.neid);
                 return {
                     mentioned_as: entity.mentioned_as,
@@ -437,7 +449,6 @@ export function useThesisResearch() {
                     type: candidate?.type,
                 };
             } else if (sel.freeText) {
-                // User provided a correction — mark as unresolved
                 unresolvedRemain.push(entity.mentioned_as);
                 return {
                     mentioned_as: entity.mentioned_as,
@@ -451,7 +462,6 @@ export function useThesisResearch() {
         queryRewrite.value = qr;
 
         if (unresolvedRemain.length > 0) {
-            // Another round: send back to Query Rewrite Agent
             status.value = 'parsing';
             error.value = null;
 
@@ -461,17 +471,14 @@ export function useThesisResearch() {
                     throw new Error('Query Rewrite Agent returned unparseable response.');
                 }
 
-                // Update claims/data_needs if agent refined them
                 if (agentResponse.claims?.length) qr.claims = agentResponse.claims;
                 if (agentResponse.data_needs?.length) qr.data_needs = agentResponse.data_needs;
 
-                // Resolve new candidates for unresolved entities
                 const newCandidates: string[] = agentResponse.candidate_entities || [];
                 if (newCandidates.length > 0) {
                     status.value = 'resolving';
                     const resolved = await resolveEntities(newCandidates);
 
-                    // Match resolved entities back to unresolved ones
                     for (const entity of qr.entities) {
                         if (entity.status !== 'unresolved') continue;
                         const match = resolved.find(
@@ -500,7 +507,6 @@ export function useThesisResearch() {
                 status.value = 'error';
             }
         } else {
-            // All resolved — proceed to research
             await runResearchAndReport(qr);
         }
     }
@@ -515,7 +521,6 @@ export function useThesisResearch() {
         error.value = null;
 
         try {
-            // Build the research input — only resolved entities
             const researchInput = {
                 thesis_plaintext: qr.thesis_plaintext,
                 entities: qr.entities
@@ -525,28 +530,20 @@ export function useThesisResearch() {
                         neid: e.neid,
                         type: e.type,
                     })),
-                macro_indicators: qr.macro_indicators,
                 claims: qr.claims,
                 data_needs: qr.data_needs,
             };
 
-            // Send to Research Agent
-            const { finalizeData } = await sendToAgent(
+            const { researchData } = await sendToAgent(
                 'researcher',
                 JSON.stringify(researchInput),
                 { trackProgress: true }
             );
 
-            // Parse the accumulated research JSON from finalize_research()
-            let researchData: any = null;
-            if (finalizeData) {
-                researchData = tryParseJSON(finalizeData);
-            }
-
-            if (!researchData) {
+            if (!researchData?.research) {
                 throw new Error(
                     'Research Agent did not return accumulated data. ' +
-                        'The finalize_research() tool may not have been called.'
+                        'The research loop may not have completed.'
                 );
             }
 
@@ -555,7 +552,7 @@ export function useThesisResearch() {
 
             const reportInput = {
                 query: qr,
-                ...researchData,
+                calls: researchData.research.calls || [],
             };
 
             const { text: reportText } = await sendToAgent('report', JSON.stringify(reportInput));
@@ -567,8 +564,8 @@ export function useThesisResearch() {
             ) {
                 report.value = {
                     query: qr,
-                    entity_data: researchData.entity_data || {},
-                    macro_data: researchData.macro_data || {},
+                    calls: researchData.research.calls || [],
+                    show_your_work: researchData.show_your_work || {},
                     supporting_argument: reportParsed.supporting_argument || '',
                     contradicting_argument: reportParsed.contradicting_argument || '',
                     final_analysis: reportParsed.final_analysis || '',
