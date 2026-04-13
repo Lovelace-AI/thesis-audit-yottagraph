@@ -179,7 +179,13 @@ class _ElementalClient:
     ) -> None:
         status = resp.status_code
         resp_len = len(resp.content)
-        if elapsed >= SLOW_THRESHOLD_S:
+        if status >= 400:
+            body_preview = resp.text[:500] if resp.text else "(empty)"
+            _log.warning(
+                "%s %s -> %d (%d bytes) in %.2fs | request: %s | response: %s",
+                method, url, status, resp_len, elapsed, payload_hint, body_preview,
+            )
+        elif elapsed >= SLOW_THRESHOLD_S:
             _log.warning(
                 "SLOW %s %s -> %d (%d bytes) in %.1fs | %s",
                 method, url, status, resp_len, elapsed, payload_hint,

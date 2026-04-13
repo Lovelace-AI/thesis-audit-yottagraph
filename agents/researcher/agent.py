@@ -26,6 +26,14 @@ except ImportError:
     from .broadchurch_auth import elemental_client
 
 
+def _error_detail(exc: Exception) -> str:
+    """Extract a useful error string, including the response body for HTTP errors."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        body = exc.response.text[:300] if exc.response else ""
+        return f"{exc} | body: {body}" if body else str(exc)
+    return str(exc)
+
+
 # ---------------------------------------------------------------------------
 # Schema cache — PID ↔ name mapping loaded once from the Elemental API
 # ---------------------------------------------------------------------------
@@ -575,7 +583,7 @@ def _exec_get_properties(
             f"{', '.join(prop_names[:15]) if prop_names else '(none)'}."
         ), {"properties": values, "property_names": prop_names}
     except Exception as e:
-        return f"Error fetching properties for '{entity_name}': {e}", {}
+        return f"Error fetching properties for '{entity_name}': {_error_detail(e)}", {}
 
 
 def _exec_get_news(entity_name: str, neid: str, limit: int = 15) -> tuple[str, dict]:
@@ -613,7 +621,7 @@ def _exec_get_news(entity_name: str, neid: str, limit: int = 15) -> tuple[str, d
             f"Date range: {date_range}."
         ), {"articles": articles}
     except Exception as e:
-        return f"Error fetching news for '{entity_name}': {e}", {}
+        return f"Error fetching news for '{entity_name}': {_error_detail(e)}", {}
 
 
 def _get_mcp_bearer_token() -> str | None:
@@ -794,7 +802,7 @@ def _exec_get_fundamentals(entity_name: str, neid: str) -> tuple[str, dict]:
             parts.append(f"{k}={v}")
         return " ".join(parts), full_data
     except Exception as e:
-        return f"Error fetching fundamentals for '{entity_name}': {e}", {}
+        return f"Error fetching fundamentals for '{entity_name}': {_error_detail(e)}", {}
 
 
 def _exec_get_filings(
@@ -842,7 +850,7 @@ def _exec_get_filings(
             f"Form types: {', '.join(found_types)}. Date range: {date_range}."
         ), {"filings": filings}
     except Exception as e:
-        return f"Error fetching filings for '{entity_name}': {e}", {}
+        return f"Error fetching filings for '{entity_name}': {_error_detail(e)}", {}
 
 
 def _exec_get_events(entity_name: str, neid: str, limit: int = 20) -> tuple[str, dict]:
@@ -879,7 +887,7 @@ def _exec_get_events(entity_name: str, neid: str, limit: int = 20) -> tuple[str,
             f"Categories: {', '.join(categories)}."
         ), {"events": events}
     except Exception as e:
-        return f"Error fetching events for '{entity_name}': {e}", {}
+        return f"Error fetching events for '{entity_name}': {_error_detail(e)}", {}
 
 
 def _exec_get_relationships(
@@ -926,7 +934,7 @@ def _exec_get_relationships(
             f"Found {len(relationships)} related entities for '{entity_name}': {summary}."
         ), {"relationships": relationships}
     except Exception as e:
-        return f"Error fetching relationships for '{entity_name}': {e}", {}
+        return f"Error fetching relationships for '{entity_name}': {_error_detail(e)}", {}
 
 
 # ---------------------------------------------------------------------------
@@ -975,6 +983,8 @@ def _dispatch_call(call: dict) -> tuple[str, dict]:
             f"Missing required parameter(s) {missing} for {call_type}.",
             {},
         )
+    if "neid" in params and params["neid"]:
+        params["neid"] = str(params["neid"]).zfill(20)
     accepted = set(inspect.signature(executor).parameters.keys())
     filtered = {k: v for k, v in params.items() if k in accepted}
     try:
