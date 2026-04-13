@@ -1,0 +1,166 @@
+"""
+Build golden query fixtures by resolving entity names via the Elemental API.
+
+Run from the agents/ directory:
+    python -m research_learner.build_fixtures
+
+Requires ELEMENTAL_API_URL + ELEMENTAL_API_TOKEN env vars (or broadchurch.yaml).
+"""
+
+import json
+import re
+import sys
+import textwrap
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from broadchurch_auth import elemental_client
+
+# ---------------------------------------------------------------------------
+# Thesis definitions — edit this list to change the golden query set
+# ---------------------------------------------------------------------------
+
+THESIS_DEFS = [
+    {
+        "thesis": "Netflix is losing market share to Disney+ in the streaming wars",
+        "entities": ["Netflix", "The Walt Disney Company"],
+        "claims": [
+            "Netflix subscriber growth is slowing",
+            "Disney+ is gaining market share",
+        ],
+        "data_needs": ["news", "stock_prices", "filings", "events"],
+    },
+    {
+        "thesis": "Rising interest rates are hurting commercial real estate valuations",
+        "entities": ["Simon Property Group", "Prologis"],
+        "claims": [
+            "REIT valuations have declined as rates rose",
+            "Higher borrowing costs are squeezing margins",
+        ],
+        "data_needs": ["stock_prices", "filings", "events", "news"],
+    },
+    {
+        "thesis": "JPMorgan is better positioned than Goldman Sachs for a recession",
+        "entities": ["JPMorgan Chase", "Goldman Sachs"],
+        "claims": [
+            "JPMorgan has a more diversified revenue base",
+            "Goldman Sachs is more exposed to trading revenue declines",
+        ],
+        "data_needs": ["stock_prices", "filings", "news", "events", "relationships"],
+    },
+    {
+        "thesis": "Apple's services revenue growth is offsetting declining iPhone sales",
+        "entities": ["Apple"],
+        "claims": [
+            "Services revenue as a share of total revenue is increasing",
+            "iPhone unit sales have plateaued or declined",
+        ],
+        "data_needs": ["stock_prices", "filings", "news"],
+    },
+]
+
+
+def _slugify(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", text.lower())
+    return slug.strip("_")[:60]
+
+
+def _resolve_entity(name: str) -> dict | None:
+    """Search for an entity by name and return the top match."""
+    try:
+        resp = elemental_client.post(
+            "/entities/search",
+            json={
+                "queries": [{"queryId": 1, "query": name}],
+                "maxResults": 3,
+                "includeNames": True,
+                "includeFlavors": True,
+                "includeScores": True,
+                "minScore": 0.3,
+            },
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        if not results or not results[0].get("matches"):
+            return None
+        match = results[0]["matches"][0]
+        return {
+            "name": match.get("name", name),
+            "neid": match["neid"],
+            "type": match.get("flavor"),
+            "score": match.get("score"),
+        }
+    except Exception as e:
+        print(f"  ERROR resolving '{name}': {e}")
+        return None
+
+
+def build_queries() -> dict[str, dict]:
+    """Resolve all thesis entities and build the QUERIES dict."""
+    queries: dict[str, dict] = {}
+
+    for td in THESIS_DEFS:
+        thesis = td["thesis"]
+        slug = _slugify(thesis)
+        print(f"\n--- {slug} ---")
+        print(f"  Thesis: {thesis}")
+
+        entities = []
+        all_resolved = True
+        for entity_name in td["entities"]:
+            print(f"  Resolving '{entity_name}'...", end=" ")
+            result = _resolve_entity(entity_name)
+            if result:
+                print(f"-> {result['name']} (NEID: {result['neid']}, score: {result.get('score', '?')})")
+                entities.append({
+                    "mentioned_as": entity_name,
+                    "status": "resolved",
+                    "name": result["name"],
+                    "neid": result["neid"],
+                    "type": result.get("type"),
+                })
+            else:
+                print("FAILED")
+                all_resolved = False
+
+        if not all_resolved:
+            print(f"  SKIPPING {slug} — not all entities resolved")
+            continue
+
+        queries[slug] = {
+            "thesis_plaintext": thesis,
+            "entities": entities,
+            "claims": td["claims"],
+            "data_needs": td["data_needs"],
+        }
+        print(f"  OK ({len(entities)} entities)")
+
+    return queries
+
+
+def write_fixtures(queries: dict[str, dict]) -> None:
+    """Write the QUERIES dict to fixtures.py."""
+    out_path = Path(__file__).parent / "fixtures.py"
+    lines = [
+        '"""Golden query fixtures — generated by build_fixtures.py. Do not edit manually."""',
+        "",
+        "QUERIES = " + json.dumps(queries, indent=4, default=str),
+        "",
+    ]
+    out_path.write_text("\n".join(lines))
+    print(f"\nWrote {len(queries)} queries to {out_path}")
+
+
+def main() -> None:
+    print("Building golden query fixtures...")
+    print("Using Elemental API at:", elemental_client.base_url)
+    queries = build_queries()
+    if not queries:
+        print("\nERROR: No queries resolved. Check your API credentials.")
+        sys.exit(1)
+    write_fixtures(queries)
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()

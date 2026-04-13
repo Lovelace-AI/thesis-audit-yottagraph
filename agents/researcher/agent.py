@@ -1033,6 +1033,24 @@ def _load_broadchurch_config() -> dict:
     return {}
 
 
+_planner_instruction_cache: str | None = None
+
+
+def _load_planner_instruction() -> str:
+    """Load planner instruction from file if present, else use hardcoded default."""
+    global _planner_instruction_cache
+    if _planner_instruction_cache is not None:
+        return _planner_instruction_cache
+    from pathlib import Path
+
+    prompt_file = Path(__file__).parent / "planner_prompt.txt"
+    if prompt_file.exists():
+        _planner_instruction_cache = prompt_file.read_text().strip()
+    else:
+        _planner_instruction_cache = PLANNER_INSTRUCTION
+    return _planner_instruction_cache
+
+
 def _call_planner_llm(research_doc_json: str) -> dict:
     """Call Gemini to get the next research plan."""
     from google import genai
@@ -1047,7 +1065,7 @@ def _call_planner_llm(research_doc_json: str) -> dict:
         model="gemini-2.0-flash",
         contents=research_doc_json,
         config=types.GenerateContentConfig(
-            system_instruction=PLANNER_INSTRUCTION,
+            system_instruction=_load_planner_instruction(),
             response_mime_type="application/json",
             temperature=0.2,
         ),

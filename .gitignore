@@ -26,6 +26,10 @@ node_modules
 # Broadchurch tenant config (created by /broadchurch_setup, may contain project-specific settings)
 broadchurch.yaml
 
+# Research learner generated files
+agents/research_learner/learner.db
+agents/research_learner/report.html
+
 # Python virtual environments (for agents and MCP servers)
 agents/.venv/
 agents/*/.venv/
