@@ -59,13 +59,16 @@ class _TimedLLMResult:
     generate_s: float
 
 
+PLANNER_MODEL = "gemini-2.5-pro"
+
+
 def _call_planner(research_doc_json: str, instruction: str) -> _TimedLLMResult:
     """Call Gemini with a custom planner instruction. Includes retry with backoff."""
     from google import genai
     from google.genai import types
 
     doc_len = len(research_doc_json)
-    log.info(f"Planner call starting (input {doc_len:,} chars)")
+    log.info(f"Planner LLM call starting (model={PLANNER_MODEL}, input {doc_len:,} chars)")
 
     t_client = time.monotonic()
     project, region = _load_gcp_config()
@@ -77,7 +80,7 @@ def _call_planner(research_doc_json: str, instruction: str) -> _TimedLLMResult:
         try:
             t_gen = time.monotonic()
             response = client.models.generate_content(
-                model="gemini-2.0-flash",
+                model=PLANNER_MODEL,
                 contents=research_doc_json,
                 config=types.GenerateContentConfig(
                     system_instruction=instruction,
@@ -91,11 +94,11 @@ def _call_planner(research_doc_json: str, instruction: str) -> _TimedLLMResult:
             action = result.get("action", "?")
             n_calls = len(result.get("calls", []))
             log.info(
-                f"Planner returned action={action} calls={n_calls} "
-                f"(client={client_init_s:.2f}s gen={generate_s:.1f}s)"
+                f"Planner LLM returned action={action} calls={n_calls} "
+                f"(model={PLANNER_MODEL}, client={client_init_s:.2f}s gen={generate_s:.1f}s)"
             )
             if result.get("reasoning"):
-                log.debug(f"Planner reasoning: {result['reasoning']}")
+                log.debug(f"Planner LLM reasoning: {result['reasoning']}")
             return _TimedLLMResult(
                 result=result,
                 client_init_s=client_init_s,
@@ -106,10 +109,10 @@ def _call_planner(research_doc_json: str, instruction: str) -> _TimedLLMResult:
             err_str = str(e)
             if "429" in err_str or "503" in err_str or "RESOURCE_EXHAUSTED" in err_str:
                 wait = BACKOFF_SECONDS[min(attempt, len(BACKOFF_SECONDS) - 1)]
-                log.warning(f"Planner rate limited (attempt {attempt+1}), backing off {wait}s: {e}")
+                log.warning(f"Planner LLM rate limited (attempt {attempt+1}), backing off {wait}s: {e}")
                 time.sleep(wait)
             else:
-                log.error(f"Planner call failed: {e}")
+                log.error(f"Planner LLM call failed: {e}")
                 raise
     raise last_error  # type: ignore[misc]
 
@@ -194,12 +197,12 @@ def run_research(
             planner_client_s += timed.client_init_s
             planner_gen_s += timed.generate_s
         except Exception as e:
-            log.error(f"Planner error on iteration {iteration}, aborting research: {e}")
+            log.error(f"Planner LLM error on iteration {iteration}, aborting research: {e}")
             error_count += 1
             break
 
         if plan.get("action") == "done":
-            log.info(f"Planner signalled done on iteration {iteration}")
+            log.info(f"Planner LLM signalled done on iteration {iteration}")
             break
 
         for call_spec in plan.get("calls", []):
@@ -225,7 +228,7 @@ def run_research(
     log.info(
         f"Research finished: thesis={thesis!r} "
         f"iters={iterations_used} calls={call_counter} errors={error_count} ({elapsed:.1f}s) | "
-        f"planner_client={planner_client_s:.2f}s planner_gen={planner_gen_s:.1f}s "
+        f"planner_llm_client={planner_client_s:.2f}s planner_llm_gen={planner_gen_s:.1f}s "
         f"api={api_dispatch_s:.1f}s other={other_s:.2f}s"
     )
 

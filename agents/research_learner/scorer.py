@@ -154,7 +154,8 @@ def score_research(query: dict, research_doc: dict) -> ScoreResult:
     if len(scorer_input) > 200_000:
         scorer_input = scorer_input[:200_000] + '..."}'
 
-    log.info(f"Scorer call starting (input {len(scorer_input):,} chars)")
+    SCORER_MODEL = "gemini-2.5-flash"
+    log.info(f"Scorer LLM call starting (model={SCORER_MODEL}, input {len(scorer_input):,} chars)")
 
     t_client = time.monotonic()
     project, region = _load_gcp_config()
@@ -167,7 +168,7 @@ def score_research(query: dict, research_doc: dict) -> ScoreResult:
         try:
             t_gen = time.monotonic()
             response = client.models.generate_content(
-                model="gemini-2.0-flash",
+                model=SCORER_MODEL,
                 contents=scorer_input,
                 config=types.GenerateContentConfig(
                     system_instruction=SCORER_INSTRUCTION,
@@ -191,11 +192,11 @@ def score_research(query: dict, research_doc: dict) -> ScoreResult:
             )
 
             log.info(
-                f"Scorer returned: total={total} "
+                f"Scorer LLM returned: total={total} "
                 f"cov={coverage} brd={breadth} addr={addressability} eff={efficiency} "
-                f"(client={client_init_s:.2f}s gen={generate_s:.1f}s)"
+                f"(model={SCORER_MODEL}, client={client_init_s:.2f}s gen={generate_s:.1f}s)"
             )
-            log.debug(f"Scorer reasoning: {result.get('reasoning', '')}")
+            log.debug(f"Scorer LLM reasoning: {result.get('reasoning', '')}")
 
             return ScoreResult(
                 score=total,
@@ -210,14 +211,14 @@ def score_research(query: dict, research_doc: dict) -> ScoreResult:
             err_str = str(e)
             if "429" in err_str or "503" in err_str or "RESOURCE_EXHAUSTED" in err_str:
                 wait = BACKOFF_SECONDS[min(attempt, len(BACKOFF_SECONDS) - 1)]
-                log.warning(f"Scorer rate limited (attempt {attempt+1}), backing off {wait}s: {e}")
+                log.warning(f"Scorer LLM rate limited (attempt {attempt+1}), backing off {wait}s: {e}")
                 time.sleep(wait)
             else:
-                log.error(f"Scorer call failed: {e}")
+                log.error(f"Scorer LLM call failed: {e}")
                 break
 
     elapsed = time.monotonic() - t_retries
-    log.error(f"Scorer exhausted retries (client={client_init_s:.2f}s retries={elapsed:.1f}s): {last_error}")
+    log.error(f"Scorer LLM exhausted retries (model={SCORER_MODEL}, client={client_init_s:.2f}s retries={elapsed:.1f}s): {last_error}")
     return ScoreResult(
         score=0,
         coverage=0,

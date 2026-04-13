@@ -136,9 +136,11 @@ def _call_learner_llm(
         "plateau_detected": plateau_detected,
     })
 
+    LEARNER_MODEL = "gemini-2.5-pro"
     log.info(
-        f"Learner LLM call starting (highest_impact={highest_impact}, plateau={plateau_detected}, "
-        f"history={len(score_history)} entries, prompt {len(current_prompt):,} chars)"
+        f"Learner LLM call starting (model={LEARNER_MODEL}, highest_impact={highest_impact}, "
+        f"plateau={plateau_detected}, history={len(score_history)} entries, "
+        f"prompt {len(current_prompt):,} chars)"
     )
 
     t_client = time.monotonic()
@@ -151,7 +153,7 @@ def _call_learner_llm(
         try:
             t_gen = time.monotonic()
             response = client.models.generate_content(
-                model="gemini-2.5-pro",
+                model=LEARNER_MODEL,
                 contents=learner_input,
                 config=types.GenerateContentConfig(
                     system_instruction=LEARNER_INSTRUCTION,
@@ -166,7 +168,7 @@ def _call_learner_llm(
             new_len = len(result.get("prompt", ""))
             log.info(
                 f"Learner LLM returned: new prompt {new_len:,} chars "
-                f"(client={client_init_s:.2f}s gen={generate_s:.1f}s)"
+                f"(model={LEARNER_MODEL}, client={client_init_s:.2f}s gen={generate_s:.1f}s)"
             )
             if change:
                 log.info(f"Learner change: {change}")
@@ -176,7 +178,7 @@ def _call_learner_llm(
             err_str = str(e)
             if "429" in err_str or "503" in err_str or "RESOURCE_EXHAUSTED" in err_str:
                 wait = BACKOFF_SECONDS[min(attempt, len(BACKOFF_SECONDS) - 1)]
-                log.warning(f"Learner LLM rate limited (attempt {attempt+1}), backing off {wait}s: {e}")
+                log.warning(f"Learner LLM rate limited (model={LEARNER_MODEL}, attempt {attempt+1}), backing off {wait}s: {e}")
                 time.sleep(wait)
             else:
                 log.error(f"Learner LLM call failed: {e}")
