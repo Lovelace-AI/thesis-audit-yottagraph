@@ -82,6 +82,27 @@ When a `get_properties` call fails, look at the preceding call that motivated it
 to determine which skill owns the failure (it could be skill_fundamentals,
 skill_market, or skill_discovery depending on context).
 
+### Error pattern analysis
+
+Pay special attention to calls with `"status": "error"` in the call traces.
+For each error pattern you observe, consider two types of improvements:
+
+1. **Avoidance**: Can the skill teach the planner to avoid the error entirely?
+   For example, if `get_fundamentals` consistently fails on financial_instrument
+   entities, the skill might tell the planner to resolve the parent organization
+   first. If `get_stock_prices` fails on an organization, the skill might
+   suggest searching for the financial_instrument entity instead.
+
+2. **Recovery**: Can the skill teach the planner a better fallback when an error
+   occurs? For example, after a failed `get_fundamentals`, try `get_properties`
+   with specific financial fields. After a failed `get_stock_prices`, try
+   `search_entities` with `flavors: ["financial_instrument"]` for the ticker.
+
+Look for recurring error messages across multiple queries — these indicate
+systematic gaps in the current skill guidance rather than one-off data issues.
+Update the relevant skill with concrete instructions that would prevent or
+recover from the observed errors.
+
 ## Rules
 
 1. Usually modify 1-2 fields per iteration. Use `changed_fields` to declare which.
