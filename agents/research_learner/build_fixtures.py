@@ -21,41 +21,98 @@ from broadchurch_auth import elemental_client
 # ---------------------------------------------------------------------------
 
 THESIS_DEFS = [
+    # --- 1-entity prompts ---
     {
-        "thesis": "Netflix is losing market share to Disney+ in the streaming wars",
-        "entities": ["Netflix", "The Walt Disney Company"],
+        "thesis": "NVIDIA's revenue growth is primarily driven by its data center segment rather than gaming",
+        "entities": ["NVIDIA"],
         "claims": [
-            "Netflix subscriber growth is slowing",
-            "Disney+ is gaining market share",
+            "Data center revenue has grown faster than gaming in recent quarterly filings",
+            "News coverage of NVIDIA focuses on AI infrastructure rather than gaming",
         ],
-        "data_needs": ["news", "stock_prices", "filings", "events"],
+        "data_needs": ["filings", "stock_prices", "news"],
     },
     {
-        "thesis": "Rising interest rates are hurting commercial real estate valuations",
-        "entities": ["Simon Property Group", "Prologis"],
-        "claims": [
-            "REIT valuations have declined as rates rose",
-            "Higher borrowing costs are squeezing margins",
-        ],
-        "data_needs": ["stock_prices", "filings", "events", "news"],
-    },
-    {
-        "thesis": "JPMorgan is better positioned than Goldman Sachs for a recession",
-        "entities": ["JPMorgan Chase", "Goldman Sachs"],
-        "claims": [
-            "JPMorgan has a more diversified revenue base",
-            "Goldman Sachs is more exposed to trading revenue declines",
-        ],
-        "data_needs": ["stock_prices", "filings", "news", "events", "relationships"],
-    },
-    {
-        "thesis": "Apple's services revenue growth is offsetting declining iPhone sales",
+        "thesis": "Apple insiders have been net sellers of company stock over the past year",
         "entities": ["Apple"],
         "claims": [
-            "Services revenue as a share of total revenue is increasing",
-            "iPhone unit sales have plateaued or declined",
+            "Recent Form 4 filings show more insider sell transactions than buys",
+            "Executive officers have reduced their equity holdings",
         ],
-        "data_needs": ["stock_prices", "filings", "news"],
+        "data_needs": ["filings", "relationships", "news"],
+    },
+    {
+        "thesis": "Johnson and Johnson's corporate restructuring has improved its financial profile",
+        "entities": ["Johnson & Johnson"],
+        "claims": [
+            "8-K filings document significant organizational changes",
+            "Recent 10-Q filings show margin improvement in the company's continuing operations",
+        ],
+        "data_needs": ["filings", "events", "news"],
+    },
+    # --- 2-entity prompts ---
+    {
+        "thesis": "JPMorgan Chase is growing its net interest income faster than Wells Fargo",
+        "entities": ["JPMorgan Chase", "Wells Fargo"],
+        "claims": [
+            "JPMorgan's quarterly filings show higher net interest income growth",
+            "Wells Fargo's lending growth has been constrained relative to JPMorgan",
+        ],
+        "data_needs": ["filings", "stock_prices", "news"],
+    },
+    {
+        "thesis": "Microsoft's cloud business is growing faster than Alphabet's cloud division",
+        "entities": ["Microsoft", "Alphabet"],
+        "claims": [
+            "Microsoft's cloud segment revenue growth exceeds Google Cloud revenue growth in recent 10-K filings",
+            "Both companies identify cloud as a primary growth driver in their annual filings",
+        ],
+        "data_needs": ["filings", "stock_prices", "news"],
+    },
+    {
+        "thesis": "PepsiCo's diversified portfolio gives it more stable revenue than Coca-Cola",
+        "entities": ["PepsiCo", "Coca-Cola"],
+        "claims": [
+            "PepsiCo's total revenue exceeds Coca-Cola's due to its snack and food segments",
+            "Coca-Cola's revenue is more concentrated in beverages per 10-K segment disclosures",
+        ],
+        "data_needs": ["filings", "stock_prices", "news"],
+    },
+    {
+        "thesis": "ExxonMobil's acquisition activity positions it ahead of Chevron for production growth",
+        "entities": ["ExxonMobil", "Chevron"],
+        "claims": [
+            "ExxonMobil's 8-K filings show more recent acquisition activity than Chevron's",
+            "Chevron's quarterly production volume growth trails ExxonMobil's based on recent filings",
+        ],
+        "data_needs": ["filings", "events", "news", "relationships"],
+    },
+    # --- 3-entity prompts ---
+    {
+        "thesis": "Apple, Microsoft, and Alphabet hold the largest cash reserves among US tech companies",
+        "entities": ["Apple", "Microsoft", "Alphabet"],
+        "claims": [
+            "All three report cash and short-term investments exceeding $50 billion in recent quarterly filings",
+            "Their combined cash positions have grown year-over-year",
+        ],
+        "data_needs": ["filings", "stock_prices", "news"],
+    },
+    {
+        "thesis": "Visa and Mastercard's asset-light network model produces higher margins than American Express",
+        "entities": ["Visa", "Mastercard", "American Express"],
+        "claims": [
+            "Visa and Mastercard report higher operating margins than American Express in 10-K filings",
+            "American Express carries credit risk on its balance sheet that Visa and Mastercard do not",
+        ],
+        "data_needs": ["filings", "stock_prices", "news", "relationships"],
+    },
+    {
+        "thesis": "Amazon and Walmart are outpacing Target in the retail competition",
+        "entities": ["Amazon", "Walmart", "Target"],
+        "claims": [
+            "Amazon and Walmart's revenue growth in recent quarterly filings exceeds Target's",
+            "Target's stock performance has lagged both Amazon and Walmart",
+        ],
+        "data_needs": ["filings", "stock_prices", "news", "events"],
     },
 ]
 
