@@ -1,11 +1,11 @@
 """
 Research scorer — evaluates research output quality via Gemini with a fixed rubric.
 
-Returns a score in [0, 100] composed of four sub-scores (0-25 each):
-  - Coverage: Did research cover all entities in the query?
-  - Breadth: Were all relevant data types fetched per data_needs?
-  - Addressability: Does the data help evaluate each claim?
-  - Efficiency: Was research completed without wasted calls?
+Each dimension is scored 0-25, then the weighted total (0-100) is computed:
+  - Coverage     (weight 0.20): Did research cover all entities in the query?
+  - Breadth      (weight 0.20): Were all relevant data types fetched per data_needs?
+  - Addressability (weight 0.50): Does the data help evaluate each claim?
+  - Efficiency   (weight 0.10): Was research completed without wasted calls?
 """
 
 import json
@@ -15,6 +15,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from research_learner.log import get_logger
+
+log = get_logger("scorer")
 
 SCORER_INSTRUCTION = """\
 You are a research quality evaluator. You receive a thesis query and the research
@@ -65,12 +69,22 @@ Was the research completed without waste?
 - 5-14: Significant waste (many duplicates or error retries)
 - 0-4: Mostly wasted calls
 
+## Dimension weights
+
+The total score is computed as a weighted sum of the four dimensions:
+- Coverage: 20%
+- Breadth: 20%
+- Addressability: 50% (most important — research must help evaluate the claims)
+- Efficiency: 10%
+
+Addressability is the dominant factor. Focus your evaluation there most carefully.
+
 ## Output
 
-Return ONLY a JSON object (no markdown, no explanation):
+Return ONLY a JSON object (no markdown, no explanation).
+Score each dimension 0-25 independently. The weighted total is computed externally.
 
 {
-    "score": <total 0-100>,
     "coverage": <0-25>,
     "breadth": <0-25>,
     "addressability": <0-25>,
@@ -78,6 +92,13 @@ Return ONLY a JSON object (no markdown, no explanation):
     "reasoning": "<2-3 sentences explaining the scores>"
 }
 """
+
+DIMENSION_WEIGHTS = {
+    "coverage": 0.20,
+    "breadth": 0.20,
+    "addressability": 0.50,
+    "efficiency": 0.10,
+}
 
 MAX_RETRIES = 3
 BACKOFF_SECONDS = [5, 15, 45]
@@ -126,20 +147,25 @@ def score_research(query: dict, research_doc: dict) -> ScoreResult:
     from google import genai
     from google.genai import types
 
-    project, region = _load_gcp_config()
-    client = genai.Client(vertexai=True, project=project, location=region)
-
     scorer_input = json.dumps(
         {"query": query, "research": research_doc},
         default=str,
     )
-    # Truncate to avoid blowing context window
     if len(scorer_input) > 200_000:
         scorer_input = scorer_input[:200_000] + '..."}'
 
+    log.info(f"Scorer call starting (input {len(scorer_input):,} chars)")
+
+    t_client = time.monotonic()
+    project, region = _load_gcp_config()
+    client = genai.Client(vertexai=True, project=project, location=region)
+    client_init_s = time.monotonic() - t_client
+
+    t_retries = time.monotonic()
     last_error: Exception | None = None
     for attempt in range(MAX_RETRIES):
         try:
+            t_gen = time.monotonic()
             response = client.models.generate_content(
                 model="gemini-2.0-flash",
                 contents=scorer_input,
@@ -150,11 +176,26 @@ def score_research(query: dict, research_doc: dict) -> ScoreResult:
                 ),
             )
             result = json.loads(response.text)
+            generate_s = time.monotonic() - t_gen
+
             coverage = _clamp(int(result.get("coverage", 0)), 0, 25)
             breadth = _clamp(int(result.get("breadth", 0)), 0, 25)
             addressability = _clamp(int(result.get("addressability", 0)), 0, 25)
             efficiency = _clamp(int(result.get("efficiency", 0)), 0, 25)
-            total = coverage + breadth + addressability + efficiency
+            total = round(
+                (coverage / 25 * DIMENSION_WEIGHTS["coverage"]
+                 + breadth / 25 * DIMENSION_WEIGHTS["breadth"]
+                 + addressability / 25 * DIMENSION_WEIGHTS["addressability"]
+                 + efficiency / 25 * DIMENSION_WEIGHTS["efficiency"])
+                * 100
+            )
+
+            log.info(
+                f"Scorer returned: total={total} "
+                f"cov={coverage} brd={breadth} addr={addressability} eff={efficiency} "
+                f"(client={client_init_s:.2f}s gen={generate_s:.1f}s)"
+            )
+            log.debug(f"Scorer reasoning: {result.get('reasoning', '')}")
 
             return ScoreResult(
                 score=total,
@@ -169,10 +210,14 @@ def score_research(query: dict, research_doc: dict) -> ScoreResult:
             err_str = str(e)
             if "429" in err_str or "503" in err_str or "RESOURCE_EXHAUSTED" in err_str:
                 wait = BACKOFF_SECONDS[min(attempt, len(BACKOFF_SECONDS) - 1)]
+                log.warning(f"Scorer rate limited (attempt {attempt+1}), backing off {wait}s: {e}")
                 time.sleep(wait)
             else:
+                log.error(f"Scorer call failed: {e}")
                 break
 
+    elapsed = time.monotonic() - t_retries
+    log.error(f"Scorer exhausted retries (client={client_init_s:.2f}s retries={elapsed:.1f}s): {last_error}")
     return ScoreResult(
         score=0,
         coverage=0,

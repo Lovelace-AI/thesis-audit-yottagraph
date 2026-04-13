@@ -28,6 +28,8 @@ broadchurch.yaml
 
 # Research learner generated files
 agents/research_learner/learner.db
+agents/research_learner/learner.db-wal
+agents/research_learner/learner.db-shm
 agents/research_learner/report.html
 
 # Python virtual environments (for agents and MCP servers)

@@ -16,6 +16,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from researcher.agent import _abridge_research_doc, _dispatch_call, _load_schema
 
+from research_learner.log import get_logger
+
+log = get_logger("runner")
+
 MAX_RETRIES = 3
 BACKOFF_SECONDS = [5, 15, 45]
 
@@ -46,17 +50,32 @@ def _load_gcp_config() -> tuple[str, str]:
     return "broadchurch", "us-central1"
 
 
-def _call_planner(research_doc_json: str, instruction: str) -> dict:
+@dataclass
+class _TimedLLMResult:
+    """Wraps an LLM result with timing metadata for the caller to aggregate."""
+
+    result: dict
+    client_init_s: float
+    generate_s: float
+
+
+def _call_planner(research_doc_json: str, instruction: str) -> _TimedLLMResult:
     """Call Gemini with a custom planner instruction. Includes retry with backoff."""
     from google import genai
     from google.genai import types
 
+    doc_len = len(research_doc_json)
+    log.info(f"Planner call starting (input {doc_len:,} chars)")
+
+    t_client = time.monotonic()
     project, region = _load_gcp_config()
     client = genai.Client(vertexai=True, project=project, location=region)
+    client_init_s = time.monotonic() - t_client
 
     last_error: Exception | None = None
     for attempt in range(MAX_RETRIES):
         try:
+            t_gen = time.monotonic()
             response = client.models.generate_content(
                 model="gemini-2.0-flash",
                 contents=research_doc_json,
@@ -66,32 +85,70 @@ def _call_planner(research_doc_json: str, instruction: str) -> dict:
                     temperature=0.2,
                 ),
             )
-            return json.loads(response.text)
+            result = json.loads(response.text)
+            generate_s = time.monotonic() - t_gen
+
+            action = result.get("action", "?")
+            n_calls = len(result.get("calls", []))
+            log.info(
+                f"Planner returned action={action} calls={n_calls} "
+                f"(client={client_init_s:.2f}s gen={generate_s:.1f}s)"
+            )
+            if result.get("reasoning"):
+                log.debug(f"Planner reasoning: {result['reasoning']}")
+            return _TimedLLMResult(
+                result=result,
+                client_init_s=client_init_s,
+                generate_s=generate_s,
+            )
         except Exception as e:
             last_error = e
             err_str = str(e)
             if "429" in err_str or "503" in err_str or "RESOURCE_EXHAUSTED" in err_str:
                 wait = BACKOFF_SECONDS[min(attempt, len(BACKOFF_SECONDS) - 1)]
+                log.warning(f"Planner rate limited (attempt {attempt+1}), backing off {wait}s: {e}")
                 time.sleep(wait)
             else:
+                log.error(f"Planner call failed: {e}")
                 raise
     raise last_error  # type: ignore[misc]
 
 
 def _dispatch_with_retry(call_spec: dict) -> tuple[str, dict]:
     """Wrap _dispatch_call with retry for transient HTTP errors."""
+    call_type = call_spec.get("type", "?")
+    params = call_spec.get("params", {})
+    entity = params.get("entity_id") or params.get("neid") or ""
+    label = f"{call_type}"
+    if entity:
+        label += f"({entity})"
+
+    log.info(f"API call starting: {label}")
+    t0 = time.monotonic()
+
     last_error: Exception | None = None
     for attempt in range(MAX_RETRIES):
         try:
-            return _dispatch_call(call_spec)
+            summary, data = _dispatch_call(call_spec)
+            elapsed = time.monotonic() - t0
+            ok = bool(data)
+            log.info(f"API call returned: {label} ok={ok} ({elapsed:.1f}s)")
+            if not ok:
+                log.debug(f"API call error detail: {label} -> {summary[:200]}")
+            return summary, data
         except Exception as e:
             last_error = e
             err_str = str(e)
             if "429" in err_str or "503" in err_str:
                 wait = BACKOFF_SECONDS[min(attempt, len(BACKOFF_SECONDS) - 1)]
+                log.warning(f"API call {label} rate limited (attempt {attempt+1}), backing off {wait}s")
                 time.sleep(wait)
             else:
+                elapsed = time.monotonic() - t0
+                log.error(f"API call failed: {label} ({elapsed:.1f}s): {e}")
                 return f"Error: {e}", {}
+    elapsed = time.monotonic() - t0
+    log.error(f"API call exhausted retries: {label} ({elapsed:.1f}s): {last_error}")
     return f"Error after {MAX_RETRIES} retries: {last_error}", {}
 
 
@@ -110,6 +167,10 @@ def run_research(
     Returns:
         ResearchResult with the research doc, stats, and full data.
     """
+    thesis = query.get("thesis", "?")[:80]
+    log.info(f"Research starting: thesis={thesis!r} max_iter={max_iterations}")
+    t0 = time.monotonic()
+
     _load_schema()
 
     research_doc: dict = {"query": query, "calls": []}
@@ -118,22 +179,34 @@ def run_research(
     error_count = 0
     iterations_used = 0
 
+    planner_client_s = 0.0
+    planner_gen_s = 0.0
+    api_dispatch_s = 0.0
+
     for iteration in range(1, max_iterations + 1):
         iterations_used = iteration
+        log.debug(f"Research iteration {iteration}/{max_iterations}")
         prompt = _abridge_research_doc(research_doc)
 
         try:
-            plan = _call_planner(prompt, instruction)
+            timed = _call_planner(prompt, instruction)
+            plan = timed.result
+            planner_client_s += timed.client_init_s
+            planner_gen_s += timed.generate_s
         except Exception as e:
+            log.error(f"Planner error on iteration {iteration}, aborting research: {e}")
             error_count += 1
             break
 
         if plan.get("action") == "done":
+            log.info(f"Planner signalled done on iteration {iteration}")
             break
 
         for call_spec in plan.get("calls", []):
             call_counter += 1
+            t_api = time.monotonic()
             summary, data = _dispatch_with_retry(call_spec)
+            api_dispatch_s += time.monotonic() - t_api
             status = "ok" if data else "error"
             if status == "error":
                 error_count += 1
@@ -146,6 +219,15 @@ def run_research(
             }
             research_doc["calls"].append(call_record)
             full_results[call_counter] = data
+
+    elapsed = time.monotonic() - t0
+    other_s = elapsed - planner_client_s - planner_gen_s - api_dispatch_s
+    log.info(
+        f"Research finished: thesis={thesis!r} "
+        f"iters={iterations_used} calls={call_counter} errors={error_count} ({elapsed:.1f}s) | "
+        f"planner_client={planner_client_s:.2f}s planner_gen={planner_gen_s:.1f}s "
+        f"api={api_dispatch_s:.1f}s other={other_s:.2f}s"
+    )
 
     return ResearchResult(
         research_doc=research_doc,
@@ -183,14 +265,28 @@ def run_batch(
         List of BatchRunResult with research and optional score for each query.
     """
     workers = min(len(queries), max_workers)
+    log.info(f"Batch starting: {len(queries)} queries, {workers} workers")
+    batch_t0 = time.monotonic()
 
     def _run_one(key: str, query: dict) -> BatchRunResult:
+        log.info(f"Batch query [{key}] starting")
+        q_t0 = time.monotonic()
+
+        t_research = time.monotonic()
         research = run_research(query, instruction, max_iterations)
+        research_s = time.monotonic() - t_research
+
         score = None
+        score_s = 0.0
         if score_fn:
             try:
+                log.info(f"Batch query [{key}] scoring starting")
+                t_score = time.monotonic()
                 score = score_fn(query, research.research_doc)
+                score_s = time.monotonic() - t_score
+                log.info(f"Batch query [{key}] scored: {score.get('score', '?')} ({score_s:.1f}s)")
             except Exception as e:
+                log.error(f"Batch query [{key}] scoring failed: {e}")
                 score = {
                     "score": 0,
                     "coverage": 0,
@@ -199,6 +295,12 @@ def run_batch(
                     "efficiency": 0,
                     "reasoning": f"Scoring failed: {e}",
                 }
+
+        q_elapsed = time.monotonic() - q_t0
+        log.info(
+            f"Batch query [{key}] complete ({q_elapsed:.1f}s) | "
+            f"research={research_s:.1f}s scoring={score_s:.1f}s"
+        )
         return BatchRunResult(query_key=key, research=research, score=score)
 
     results: list[BatchRunResult] = []
@@ -209,6 +311,9 @@ def run_batch(
         }
         for future in as_completed(futures):
             results.append(future.result())
+
+    batch_elapsed = time.monotonic() - batch_t0
+    log.info(f"Batch complete: {len(results)} results ({batch_elapsed:.1f}s)")
 
     results.sort(key=lambda r: r.query_key)
     return results

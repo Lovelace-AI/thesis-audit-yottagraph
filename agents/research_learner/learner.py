@@ -13,8 +13,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from research_learner.db import LearnerDB
 from research_learner.fixtures import QUERIES
+from research_learner.log import get_logger
 from research_learner.runner import run_batch
-from research_learner.scorer import ScoreResult, score_research
+from research_learner.scorer import DIMENSION_WEIGHTS, ScoreResult, score_research
+
+log = get_logger("learner")
 
 LEARNER_INSTRUCTION = """\
 You are a prompt engineer optimizing a system instruction for a financial research
@@ -24,13 +27,20 @@ and a growing research document, then decides which API calls to make next.
 ## Your task
 
 Given the current planner instruction and its recent performance scores, produce
-an improved version. The goal is to maximize the total score (0-100) across four
-dimensions:
+an improved version. The goal is to maximize the weighted total score (0-100).
 
-- **Coverage** (0-25): Did research cover all entities in the query?
-- **Breadth** (0-25): Were all relevant data types fetched per data_needs?
-- **Addressability** (0-25): Does the gathered data help evaluate each claim?
-- **Efficiency** (0-25): Was research completed without wasted calls?
+Each dimension is scored 0-25, then weighted to compute the total:
+
+| Dimension        | Weight | Max contribution |
+|------------------|--------|------------------|
+| Coverage         | 0.20   | 20 points        |
+| Breadth          | 0.20   | 20 points        |
+| Addressability   | 0.50   | 50 points        |
+| Efficiency       | 0.10   | 10 points        |
+
+**Addressability is by far the most important dimension.** The research must
+gather data that directly helps evaluate each claim in the thesis. Coverage and
+breadth support this, but are secondary. Efficiency is a tiebreaker.
 
 ## Input
 
@@ -38,7 +48,9 @@ You receive JSON with:
 - `current_prompt`: the full text of the current planner instruction
 - `score_history`: recent iterations with scores and change descriptions
 - `sub_scores`: per-dimension average scores for the current prompt
-- `weakest_dimension`: which dimension scored lowest
+- `dimension_weights`: the weight of each dimension in the total score
+- `highest_impact_dimension`: dimension where improvement would most increase
+  the weighted total (accounts for both headroom and weight)
 - `plateau_detected`: true if scores haven't improved in 3+ iterations
 
 ## Rules
@@ -46,7 +58,9 @@ You receive JSON with:
 1. Make **incremental** changes — 1-2 targeted edits per iteration, not wholesale rewrites.
 2. You MUST preserve the JSON response format specification. The planner must still
    return `{"action": "research"|"done", "reasoning": "...", "calls": [...]}`.
-3. Focus on the **weakest dimension** unless it's already near max.
+3. Focus on the **highest_impact_dimension** — this accounts for both the current
+   score gap and the dimension's weight. A small improvement to addressability
+   (weight 0.50) is worth more than a large improvement to efficiency (weight 0.10).
 4. If `plateau_detected` is true, try a more creative or structural change.
 5. Do NOT remove information about available API calls or their parameters.
 6. Do NOT change the fundamental architecture (planner decides, code executes).
@@ -103,24 +117,41 @@ def _call_learner_llm(
     from google import genai
     from google.genai import types
 
-    project, region = _load_gcp_config()
-    client = genai.Client(vertexai=True, project=project, location=region)
-
-    weakest = min(sub_scores, key=lambda k: sub_scores[k]) if sub_scores else "coverage"
+    # Highest-impact dimension: where (headroom * weight) is greatest
+    if sub_scores:
+        impact = {
+            k: (25 - sub_scores.get(k, 0)) * DIMENSION_WEIGHTS.get(k, 0.25)
+            for k in DIMENSION_WEIGHTS
+        }
+        highest_impact = max(impact, key=lambda k: impact[k])
+    else:
+        highest_impact = "addressability"
 
     learner_input = json.dumps({
         "current_prompt": current_prompt,
         "score_history": score_history,
         "sub_scores": sub_scores,
-        "weakest_dimension": weakest,
+        "dimension_weights": DIMENSION_WEIGHTS,
+        "highest_impact_dimension": highest_impact,
         "plateau_detected": plateau_detected,
     })
+
+    log.info(
+        f"Learner LLM call starting (highest_impact={highest_impact}, plateau={plateau_detected}, "
+        f"history={len(score_history)} entries, prompt {len(current_prompt):,} chars)"
+    )
+
+    t_client = time.monotonic()
+    project, region = _load_gcp_config()
+    client = genai.Client(vertexai=True, project=project, location=region)
+    client_init_s = time.monotonic() - t_client
 
     last_error: Exception | None = None
     for attempt in range(MAX_RETRIES):
         try:
+            t_gen = time.monotonic()
             response = client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-2.5-pro",
                 contents=learner_input,
                 config=types.GenerateContentConfig(
                     system_instruction=LEARNER_INSTRUCTION,
@@ -128,14 +159,27 @@ def _call_learner_llm(
                     temperature=0.4,
                 ),
             )
-            return json.loads(response.text)
+            result = json.loads(response.text)
+            generate_s = time.monotonic() - t_gen
+
+            change = result.get("change_description", "")
+            new_len = len(result.get("prompt", ""))
+            log.info(
+                f"Learner LLM returned: new prompt {new_len:,} chars "
+                f"(client={client_init_s:.2f}s gen={generate_s:.1f}s)"
+            )
+            if change:
+                log.info(f"Learner change: {change}")
+            return result
         except Exception as e:
             last_error = e
             err_str = str(e)
             if "429" in err_str or "503" in err_str or "RESOURCE_EXHAUSTED" in err_str:
                 wait = BACKOFF_SECONDS[min(attempt, len(BACKOFF_SECONDS) - 1)]
+                log.warning(f"Learner LLM rate limited (attempt {attempt+1}), backing off {wait}s: {e}")
                 time.sleep(wait)
             else:
+                log.error(f"Learner LLM call failed: {e}")
                 raise
     raise RuntimeError(f"Learner LLM failed after {MAX_RETRIES} retries: {last_error}")
 
@@ -203,6 +247,7 @@ def run_learner(
     if iterations is None and hours is None:
         raise ValueError("Specify at least one of --iterations or --hours")
 
+    from research_learner.log import LOG_PATH
     from research_learner.report import generate_report
 
     db = LearnerDB(db_path or Path(__file__).parent / "learner.db")
@@ -213,9 +258,9 @@ def run_learner(
 
     if db.prompt_count() == 0 or force_seed:
         db.insert_prompt(seed_prompt, parent_id=None, generation=0, change_description="Seed prompt")
-        print("Inserted seed prompt (id=1)")
+        log.info("Inserted seed prompt (id=1)")
     elif db.prompt_count() > 0:
-        print(f"DB already has {db.prompt_count()} prompt(s), resuming from latest.")
+        log.info(f"DB has {db.prompt_count()} existing prompt(s), resuming from latest")
 
     # Query set
     if query_key:
@@ -229,13 +274,13 @@ def run_learner(
     if not queries:
         raise ValueError("No queries available. Run build_fixtures.py first.")
 
-    print(f"Running against {len(queries)} query(ies): {', '.join(queries.keys())}")
-    print(f"Parallel workers: {min(len(queries), max_workers)}")
+    log.info(f"Query set: {len(queries)} queries ({', '.join(queries.keys())})")
+    log.info(f"Parallel workers: {min(len(queries), max_workers)}")
 
     # Resume offset
     completed = db.get_completed_iterations()
     if completed > 0:
-        print(f"Resuming from iteration {completed + 1}")
+        log.info(f"Resuming from iteration {completed + 1}")
 
     # Limits
     max_iters = iterations if iterations is not None else float("inf")
@@ -245,31 +290,55 @@ def run_learner(
     iteration_times: list[float] = []
     current_iter = completed
 
+    # Cumulative phase timers
+    cum_batch_s = 0.0
+    cum_db_s = 0.0
+    cum_learner_llm_s = 0.0
+    cum_cooldown_s = 0.0
+
+    # Concise startup message on stdout
+    limit_parts = []
+    if iterations is not None:
+        limit_parts.append(f"{iterations} iterations")
+    if hours is not None:
+        limit_parts.append(f"{hours}h")
+    print(f"learner: {len(queries)} queries, {' / '.join(limit_parts)}")
+    print(f"log: tail -f {LOG_PATH}")
+    log.info(f"=== Learner starting: {' / '.join(limit_parts)} ===")
+
     try:
         while current_iter < completed + max_iters:
             elapsed = time.monotonic() - start_time
 
-            # Check time limit, estimating if we can fit another iteration
             if hours is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    print(f"\nTime limit reached ({_format_elapsed(elapsed)} elapsed).")
+                    log.info(f"Time limit reached ({_format_elapsed(elapsed)} elapsed)")
                     break
                 if iteration_times:
                     avg_iter_time = sum(iteration_times) / len(iteration_times)
                     if remaining < avg_iter_time * 0.8:
-                        print(f"\nNot enough time for another iteration (~{_format_elapsed(avg_iter_time)} needed, {_format_elapsed(remaining)} remaining).")
+                        log.info(
+                            f"Not enough time for another iteration "
+                            f"(~{_format_elapsed(avg_iter_time)} needed, "
+                            f"{_format_elapsed(remaining)} remaining)"
+                        )
                         break
 
             current_iter += 1
             iter_start = time.monotonic()
 
-            # Load current prompt
             prompt_rec = db.get_latest_prompt()
             if not prompt_rec:
                 raise RuntimeError("No prompts in DB")
 
-            # Run research + scoring in parallel
+            log.info(
+                f"--- Iteration {current_iter} starting "
+                f"(prompt id={prompt_rec.id}, gen={prompt_rec.generation}) ---"
+            )
+
+            # Phase 1: research + scoring batch
+            t_batch = time.monotonic()
             results = run_batch(
                 queries,
                 prompt_rec.prompt_text,
@@ -277,8 +346,11 @@ def run_learner(
                 max_workers=max_workers,
                 max_iterations=max_research_iterations,
             )
+            batch_s = time.monotonic() - t_batch
+            cum_batch_s += batch_s
 
-            # Record runs
+            # Phase 2: DB writes + aggregation
+            t_db = time.monotonic()
             scores = []
             for r in results:
                 s = r.score or {"score": 0, "coverage": 0, "breadth": 0, "addressability": 0, "efficiency": 0, "reasoning": ""}
@@ -298,15 +370,18 @@ def run_learner(
                     errors=r.research.errors,
                 )
                 scores.append(s["score"])
+                log.info(
+                    f"Run recorded: query={r.query_key} score={s['score']} "
+                    f"iters={r.research.iterations_used} calls={r.research.calls_made} "
+                    f"errors={r.research.errors}"
+                )
 
-            # Aggregate
             avg_score = sum(scores) / len(scores) if scores else 0.0
             min_score = min(scores) if scores else 0.0
             max_score = max(scores) if scores else 0.0
             sub = db.get_sub_scores_for_iteration(prompt_rec.id)
             best_ever = db.get_best_score_ever()
 
-            # Record learner iteration
             db.insert_learner_iteration(
                 iteration_number=current_iter,
                 prompt_id=prompt_rec.id,
@@ -314,32 +389,17 @@ def run_learner(
                 min_score=min_score,
                 max_score=max_score,
             )
+            db_s = time.monotonic() - t_db
+            cum_db_s += db_s
 
-            iter_elapsed = time.monotonic() - iter_start
-            iteration_times.append(iter_elapsed)
-            total_elapsed = time.monotonic() - start_time
-
-            # Progress output
-            limit_str = ""
-            if iterations is not None:
-                limit_str = f"/{completed + iterations}"
-            if hours is not None:
-                remaining = deadline - time.monotonic()
-                limit_str += f" ({_format_elapsed(remaining)} left)"
-
-            print(
-                f"[iter {current_iter}{limit_str}] "
-                f"prompt={prompt_rec.id} "
-                f"avg={avg_score:.1f} best_ever={best_ever:.1f} "
-                f"cov={sub['coverage']:.0f} brd={sub['breadth']:.0f} "
-                f"addr={sub['addressability']:.0f} eff={sub['efficiency']:.0f} "
-                f"elapsed={_format_elapsed(total_elapsed)}"
-            )
-
-            # Generate next prompt
+            # Phase 3: learner LLM — generate next prompt
             score_history = db.get_recent_score_history(limit=10)
             plateau = _detect_plateau(score_history)
+            if plateau:
+                log.info("Plateau detected — learner will try a more creative change")
 
+            t_learner = time.monotonic()
+            learner_llm_s = 0.0
             try:
                 learner_result = _call_learner_llm(
                     current_prompt=prompt_rec.prompt_text,
@@ -347,6 +407,7 @@ def run_learner(
                     sub_scores=sub,
                     plateau_detected=plateau,
                 )
+                learner_llm_s = time.monotonic() - t_learner
                 new_prompt = learner_result.get("prompt", "")
                 change_desc = learner_result.get("change_description", "")
 
@@ -357,49 +418,100 @@ def run_learner(
                         generation=prompt_rec.generation + 1,
                         change_description=change_desc,
                     )
-                    if change_desc:
-                        print(f"  -> Change: {change_desc}")
+                    log.info(f"New prompt inserted (gen {prompt_rec.generation + 1}): {change_desc}")
                 else:
-                    print("  -> Learner returned unchanged prompt, retrying next iteration")
+                    log.warning("Learner returned unchanged prompt, will retry next iteration")
             except Exception as e:
-                print(f"  -> Learner LLM error: {e}")
+                learner_llm_s = time.monotonic() - t_learner
+                log.error(f"Learner LLM error: {e}")
+            cum_learner_llm_s += learner_llm_s
 
-            # Periodic summary
-            if current_iter % 10 == 0 and iteration_times:
-                avg_time = sum(iteration_times) / len(iteration_times)
-                print(f"  [summary] avg iter time: {_format_elapsed(avg_time)}, best ever: {best_ever:.1f}")
+            iter_elapsed = time.monotonic() - iter_start
+            iteration_times.append(iter_elapsed)
+            total_elapsed = time.monotonic() - start_time
 
+            log.info(
+                f"Iteration {current_iter} scores: "
+                f"avg={avg_score:.1f} min={min_score:.0f} max={max_score:.0f} "
+                f"best_ever={best_ever:.1f} "
+                f"cov={sub['coverage']:.0f} brd={sub['breadth']:.0f} "
+                f"addr={sub['addressability']:.0f} eff={sub['efficiency']:.0f}"
+            )
+            log.info(
+                f"Iteration {current_iter} timing: "
+                f"total={iter_elapsed:.1f}s | "
+                f"batch={batch_s:.1f}s db={db_s:.2f}s learner_llm={learner_llm_s:.1f}s "
+                f"cooldown={cooldown:.1f}s"
+            )
+
+            # Concise stdout: one line per iteration
+            limit_str = ""
+            if iterations is not None:
+                limit_str = f"/{completed + iterations}"
+            if hours is not None:
+                remaining = deadline - time.monotonic()
+                limit_str += f" {_format_elapsed(remaining)} left"
+            print(
+                f"  #{current_iter}{limit_str}  "
+                f"avg={avg_score:.1f}  best={best_ever:.1f}  "
+                f"({_format_elapsed(iter_elapsed)})"
+            )
+
+            # Phase 4: cooldown
+            t_cool = time.monotonic()
             time.sleep(cooldown)
+            cum_cooldown_s += time.monotonic() - t_cool
 
     except KeyboardInterrupt:
-        print(f"\n\nInterrupted at iteration {current_iter}.")
+        log.info(f"Interrupted at iteration {current_iter}")
+        print(f"\nInterrupted at iteration {current_iter}.")
 
-    # Auto-summary
+    # Summary
     total_elapsed = time.monotonic() - start_time
     iterations_done = current_iter - completed
 
-    print(f"\n{'='*60}")
-    print(f"Learner finished: {iterations_done} iteration(s) in {_format_elapsed(total_elapsed)}")
+    log.info(f"=== Learner finished: {iterations_done} iteration(s) in {_format_elapsed(total_elapsed)} ===")
+
+    if iterations_done > 0:
+        avg_iter = sum(iteration_times) / len(iteration_times) if iteration_times else 0
+        log.info(
+            f"Cumulative timing: "
+            f"batch={cum_batch_s:.1f}s ({cum_batch_s/total_elapsed*100:.0f}%) "
+            f"db={cum_db_s:.1f}s ({cum_db_s/total_elapsed*100:.0f}%) "
+            f"learner_llm={cum_learner_llm_s:.1f}s ({cum_learner_llm_s/total_elapsed*100:.0f}%) "
+            f"cooldown={cum_cooldown_s:.1f}s ({cum_cooldown_s/total_elapsed*100:.0f}%)"
+        )
+        log.info(
+            f"Per-iteration avg: "
+            f"total={avg_iter:.1f}s "
+            f"batch={cum_batch_s/iterations_done:.1f}s "
+            f"db={cum_db_s/iterations_done:.2f}s "
+            f"learner_llm={cum_learner_llm_s/iterations_done:.1f}s"
+        )
+
+    print(f"\n{'='*50}")
+    print(f"Done: {iterations_done} iterations in {_format_elapsed(total_elapsed)}")
 
     best = db.get_best_prompt()
     if best:
         best_avg = db.get_avg_score_for_prompt(best.id)
-        print(f"Best prompt: id={best.id} (generation {best.generation}), avg score={best_avg:.1f}")
+        print(f"Best prompt: id={best.id} gen={best.generation} avg={best_avg:.1f}")
+        log.info(f"Best prompt: id={best.id} gen={best.generation} avg={best_avg:.1f}")
 
         lineage = db.get_prompt_lineage(best.id)
         if len(lineage) > 1:
-            print(f"\nEvolution ({len(lineage)} steps):")
+            log.info(f"Prompt evolution ({len(lineage)} steps):")
             for p in lineage:
                 p_avg = db.get_avg_score_for_prompt(p.id)
                 score_str = f"avg={p_avg:.1f}" if p_avg is not None else "not scored"
                 desc = p.change_description or "seed"
-                print(f"  gen {p.generation}: [{score_str}] {desc}")
+                log.info(f"  gen {p.generation}: [{score_str}] {desc}")
 
-    # Auto-generate report
     try:
         report_path = generate_report(db)
-        print(f"\nReport: {report_path}")
+        print(f"Report: {report_path}")
+        log.info(f"Report generated: {report_path}")
     except Exception as e:
-        print(f"\nReport generation failed: {e}")
+        log.error(f"Report generation failed: {e}")
 
     db.close()

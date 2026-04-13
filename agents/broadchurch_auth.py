@@ -87,7 +87,7 @@ def get_elemental_url() -> str:
     if gw_url and org_id and qs_api_key:
         return f"{gw_url.rstrip('/')}/api/qs/{org_id}"
 
-    url = config.get("query_server", {}).get("url", "https://stable-query.lovelace.ai")
+    url = config.get("query_server", {}).get("url", "https://query.news.prod.g.lovelace.ai")
     return url.rstrip("/")
 
 

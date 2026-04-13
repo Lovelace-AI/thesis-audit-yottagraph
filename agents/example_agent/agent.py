@@ -9,7 +9,7 @@ Auth is handled automatically by broadchurch_auth (bundled at deploy time):
 - Production: reads broadchurch.yaml and mints GCP ID tokens
 
 Local testing:
-    export ELEMENTAL_API_URL=https://stable-query.lovelace.ai
+    export ELEMENTAL_API_URL=https://query.news.prod.g.lovelace.ai
     export ELEMENTAL_API_TOKEN=<your-token>
     cd agents
     pip install -r example_agent/requirements.txt

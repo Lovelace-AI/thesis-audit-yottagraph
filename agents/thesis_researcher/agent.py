@@ -8,7 +8,7 @@ Two-phase workflow:
   into supporting vs contradicting signals.
 
 Local testing:
-    export ELEMENTAL_API_URL=https://stable-query.lovelace.ai
+    export ELEMENTAL_API_URL=https://query.news.prod.g.lovelace.ai
     export ELEMENTAL_API_TOKEN=<your-token>
     cd agents
     pip install -r thesis_researcher/requirements.txt

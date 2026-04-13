@@ -141,7 +141,7 @@ class TestGetElementalUrl:
         monkeypatch.chdir(tmp_path)
         monkeypatch.delenv("ELEMENTAL_API_URL", raising=False)
 
-        assert get_elemental_url() == "https://stable-query.lovelace.ai"
+        assert get_elemental_url() == "https://query.news.prod.g.lovelace.ai"
 
 
 # ---------------------------------------------------------------------------

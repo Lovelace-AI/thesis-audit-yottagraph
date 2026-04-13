@@ -8,7 +8,7 @@ abridged for the planner's context window, and full results are kept in
 memory for show_your_work.
 
 Local testing:
-    export ELEMENTAL_API_URL=https://stable-query.lovelace.ai
+    export ELEMENTAL_API_URL=https://query.news.prod.g.lovelace.ai
     export ELEMENTAL_API_TOKEN=<your-token>
     cd agents
     pip install -r researcher/requirements.txt
@@ -18,7 +18,6 @@ Local testing:
 import json
 
 import httpx
-from google.adk.agents import Agent
 
 try:
     from broadchurch_auth import elemental_client
@@ -1200,9 +1199,14 @@ You are a research orchestrator. You receive a research query as JSON.
 Do NOT modify the input. Do NOT add commentary. Just call the tool.
 """
 
-root_agent = Agent(
-    model="gemini-2.0-flash",
-    name="researcher",
-    instruction=WRAPPER_INSTRUCTION,
-    tools=[research_iteration],
-)
+try:
+    from google.adk.agents import Agent
+
+    root_agent = Agent(
+        model="gemini-2.0-flash",
+        name="researcher",
+        instruction=WRAPPER_INSTRUCTION,
+        tools=[research_iteration],
+    )
+except ImportError:
+    root_agent = None  # ADK not installed (e.g. research_learner venv)
