@@ -140,11 +140,32 @@ def get_auth_headers() -> dict[str, str]:
     return headers
 
 
+import logging
+
+_log = logging.getLogger("elemental_client")
+if not _log.handlers and not _log.parent.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s", datefmt="%H:%M:%S"))
+    _log.addHandler(_handler)
+_log.setLevel(logging.DEBUG)
+
+SLOW_THRESHOLD_S = 5.0
+
+
 class _ElementalClient:
-    """Thin wrapper around httpx that injects auth and the base URL."""
+    """Thin wrapper around httpx that injects auth and the base URL.
+
+    Uses a persistent httpx.Client for TCP/TLS connection reuse.
+    """
 
     def __init__(self, timeout: float = 30.0):
         self._timeout = timeout
+        self._session: httpx.Client | None = None
+
+    def _get_session(self) -> httpx.Client:
+        if self._session is None:
+            self._session = httpx.Client(timeout=self._timeout)
+        return self._session
 
     @property
     def base_url(self) -> str:
@@ -156,11 +177,31 @@ class _ElementalClient:
         token = get_elemental_token()
         return {"Authorization": f"Bearer {token}"} if token else {}
 
+    def _log_request(
+        self, method: str, url: str, elapsed: float, resp: httpx.Response, payload_hint: str
+    ) -> None:
+        status = resp.status_code
+        resp_len = len(resp.content)
+        if elapsed >= SLOW_THRESHOLD_S:
+            _log.warning(
+                "SLOW %s %s -> %d (%d bytes) in %.1fs | %s",
+                method, url, status, resp_len, elapsed, payload_hint,
+            )
+        else:
+            _log.debug(
+                "%s %s -> %d (%d bytes) in %.2fs",
+                method, url, status, resp_len, elapsed,
+            )
+
     def get(self, path: str, **kwargs) -> httpx.Response:
         kwargs.setdefault("timeout", self._timeout)
         headers = kwargs.pop("headers", {})
         headers.update(self._headers())
-        return httpx.get(f"{self.base_url}{path}", headers=headers, **kwargs)
+        url = f"{self.base_url}{path}"
+        t0 = time.monotonic()
+        resp = self._get_session().get(url, headers=headers, **kwargs)
+        self._log_request("GET", path, time.monotonic() - t0, resp, "")
+        return resp
 
     def post(self, path: str, **kwargs) -> httpx.Response:
         kwargs.setdefault("timeout", self._timeout)
@@ -170,7 +211,16 @@ class _ElementalClient:
         else:
             headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
         headers.update(self._headers())
-        return httpx.post(f"{self.base_url}{path}", headers=headers, **kwargs)
+        url = f"{self.base_url}{path}"
+        payload_hint = ""
+        if "data" in kwargs:
+            payload_hint = "&".join(f"{k}={str(v)[:80]}" for k, v in kwargs["data"].items())
+        elif "json" in kwargs:
+            payload_hint = str(kwargs["json"])[:200]
+        t0 = time.monotonic()
+        resp = self._get_session().post(url, headers=headers, **kwargs)
+        self._log_request("POST", path, time.monotonic() - t0, resp, payload_hint)
+        return resp
 
 
 elemental_client = _ElementalClient()

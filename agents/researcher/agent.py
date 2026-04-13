@@ -15,6 +15,7 @@ Local testing:
     adk web
 """
 
+import inspect
 import json
 
 import httpx
@@ -85,11 +86,25 @@ def _pname(pid: int) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_pids(names: list[str] | None) -> list[int] | None:
+    """Convert property names to PIDs. Returns None if names is None (fetch all)."""
+    if not names:
+        return None
+    _load_schema()
+    pids = [_name_to_pid[n] for n in names if n in _name_to_pid]
+    return pids or None
+
+
 def _fetch_properties(
-    eids: list[str], include_attrs: bool = False, timeout: float = 30.0
+    eids: list[str],
+    pids: list[int] | None = None,
+    include_attrs: bool = False,
+    timeout: float = 10.0,
 ) -> list[dict]:
-    """Fetch property values for a list of entity IDs."""
+    """Fetch property values for entity IDs, optionally filtered by PIDs."""
     data: dict[str, str] = {"eids": json.dumps(eids)}
+    if pids:
+        data["pids"] = json.dumps(pids)
     if include_attrs:
         data["include_attributes"] = "true"
     resp = elemental_client.post(
@@ -100,21 +115,37 @@ def _fetch_properties(
 
 
 def _fetch_properties_batched(
-    eids: list[str], include_attrs: bool = False, timeout: float = 10.0, batch_size: int = 5
+    eids: list[str],
+    pids: list[int] | None = None,
+    include_attrs: bool = False,
+    timeout: float = 10.0,
+    batch_size: int = 5,
 ) -> list[dict]:
     """Fetch properties in small batches to avoid timeouts on mega-entities."""
     all_values: list[dict] = []
     for i in range(0, len(eids), batch_size):
         batch = eids[i : i + batch_size]
         try:
-            all_values.extend(_fetch_properties(batch, include_attrs, timeout))
+            all_values.extend(_fetch_properties(batch, pids, include_attrs, timeout))
         except Exception:
             for eid in batch:
                 try:
-                    all_values.extend(_fetch_properties([eid], include_attrs, timeout))
+                    all_values.extend(_fetch_properties([eid], pids, include_attrs, timeout))
                 except Exception:
                     pass
     return all_values
+
+
+def _limit_values_per_pid(values: list[dict], limit: int) -> list[dict]:
+    """Keep only the most recent `limit` values per PID (by recorded_at)."""
+    by_pid: dict[int, list[dict]] = {}
+    for v in values:
+        by_pid.setdefault(v.get("pid"), []).append(v)
+    result: list[dict] = []
+    for pvs in by_pid.values():
+        pvs.sort(key=lambda x: x.get("recorded_at", ""), reverse=True)
+        result.extend(pvs[:limit])
+    return result
 
 
 def _extract_ticker(values: list[dict]) -> str | None:
@@ -476,9 +507,88 @@ def _extract_events(values: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def _exec_get_news(entity_name: str, neid: str) -> tuple[str, dict]:
-    """Fetch news. Returns (summary_string, full articles dict)."""
+def _exec_search_entities(
+    query: str,
+    flavors: list[str] | None = None,
+    max_results: int = 5,
+) -> tuple[str, dict]:
+    """Search for entities by name, with optional flavor filter."""
+    try:
+        search_query: dict = {"queryId": 1, "query": query}
+        if flavors:
+            search_query["flavors"] = flavors
+        resp = elemental_client.post(
+            "/entities/search",
+            json={
+                "queries": [search_query],
+                "maxResults": min(max_results, 20),
+                "includeNames": True,
+                "includeFlavors": True,
+                "includeScores": True,
+                "minScore": 0.5,
+            },
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        matches = resp.json().get("results", [{}])[0].get("matches", [])
+        if not matches:
+            flavor_str = f" (flavors: {', '.join(flavors)})" if flavors else ""
+            return f"No entities found for '{query}'{flavor_str}.", {}
+
+        results = [
+            {"neid": m["neid"], "name": m.get("name", ""), "flavor": m.get("flavor", ""), "score": m.get("score", 0)}
+            for m in matches
+        ]
+        names = [r["name"] or r["neid"] for r in results[:5]]
+        return (
+            f"Found {len(results)} entity match(es) for '{query}': {', '.join(names)}."
+        ), {"matches": results}
+    except Exception as e:
+        return f"Error searching for '{query}': {e}", {}
+
+
+def _exec_get_properties(
+    entity_name: str,
+    neid: str,
+    properties: list[str] | None = None,
+    limit: int = 10,
+) -> tuple[str, dict]:
+    """Fetch specific named properties for an entity.
+
+    If properties is None, returns all properties (capped by limit per PID).
+    """
     _load_schema()
+    pids = _resolve_pids(properties)
+
+    try:
+        values = _fetch_properties([neid], pids=pids, timeout=10.0)
+        if limit and values:
+            values = _limit_values_per_pid(values, limit)
+
+        unique_pids = list({v.get("pid") for v in values})
+        prop_names = sorted({_pname(pid) for pid in unique_pids if _pname(pid)})
+
+        if properties:
+            requested = ", ".join(properties)
+            return (
+                f"Found {len(values)} value(s) for '{entity_name}' "
+                f"(requested: {requested}). "
+                f"Properties present: {', '.join(prop_names) if prop_names else 'none'}."
+            ), {"properties": values, "property_names": prop_names}
+
+        return (
+            f"Found {len(values)} value(s) for '{entity_name}' "
+            f"across {len(unique_pids)} properties: "
+            f"{', '.join(prop_names[:15]) if prop_names else '(none)'}."
+        ), {"properties": values, "property_names": prop_names}
+    except Exception as e:
+        return f"Error fetching properties for '{entity_name}': {e}", {}
+
+
+def _exec_get_news(entity_name: str, neid: str, limit: int = 15) -> tuple[str, dict]:
+    """Fetch news articles linked to an entity."""
+    _load_schema()
+    news_pids = _resolve_pids(list(_NEWS_FIELDS))
 
     try:
         linked_expr = json.dumps({
@@ -487,19 +597,21 @@ def _exec_get_news(entity_name: str, neid: str) -> tuple[str, dict]:
         })
         resp = elemental_client.post(
             "/elemental/find",
-            data={"expression": linked_expr, "limit": "30"},
+            data={"expression": linked_expr, "limit": str(min(limit * 2, 60))},
         )
         resp.raise_for_status()
         eids = resp.json().get("eids", [])
         if not eids:
             return f"No linked entities found for '{entity_name}'.", {}
 
-        values = _fetch_properties_batched(eids[:20], timeout=10.0)
+        max_eids = min(len(eids), limit + 5)
+        values = _fetch_properties_batched(eids[:max_eids], pids=news_pids, timeout=10.0)
         articles = _extract_news(values)
 
         if not articles:
             return f"No news articles found for '{entity_name}'.", {}
 
+        articles = articles[:limit]
         sentiments = [a["sentiment"] for a in articles if a.get("sentiment") is not None]
         dates = [a["date"] for a in articles if a.get("date")]
         avg_sent = round(sum(sentiments) / len(sentiments), 2) if sentiments else None
@@ -603,16 +715,20 @@ def _fetch_stock_prices_mcp(ticker: str, entity_name: str = "") -> list[dict]:
 
 
 def _exec_get_stock_prices(entity_name: str, neid: str) -> tuple[str, dict]:
-    """Fetch OHLCV data or financial fundamentals."""
+    """Fetch OHLCV stock price data.
+
+    Tries: (1) OHLCV properties with PID filter, (2) MCP via ticker,
+    (3) financial_instrument entity search. Much cheaper than the old
+    waterfall because each step uses PID-filtered fetches.
+    """
     _load_schema()
+    price_pids = _resolve_pids(list(_PRICE_FIELDS) + ["ticker_symbol", "ticker"])
 
     prices: list[dict] = []
     ticker = None
-    fundamentals: dict = {}
 
-    # Strategy 0: resolve ticker first, then try MCP (avoids mega-entity timeouts)
     try:
-        values = _fetch_properties([neid], timeout=15.0)
+        values = _fetch_properties([neid], pids=price_pids, timeout=10.0)
         ticker = _extract_ticker(values)
         prices = _extract_prices(values)
     except Exception:
@@ -622,122 +738,147 @@ def _exec_get_stock_prices(entity_name: str, neid: str) -> tuple[str, dict]:
         ticker = _get_ticker_for_entity(neid)
 
     if not prices and ticker:
-        prices = _fetch_stock_prices_mcp(ticker)
+        prices = _fetch_stock_prices_mcp(ticker, entity_name)
 
-    # Strategy 1: find FI entity and fetch its properties
-    if not prices:
-        fi_neid = None
-        if ticker:
-            fi_neid = _find_financial_instrument(ticker)
-        if not fi_neid:
-            fi_neid = _find_financial_instrument(entity_name)
+    if not prices and ticker:
+        fi_neid = _find_financial_instrument(ticker)
         if fi_neid and fi_neid != neid:
             try:
-                values2 = _fetch_properties([fi_neid], timeout=15.0)
+                values2 = _fetch_properties([fi_neid], pids=price_pids, timeout=10.0)
                 prices = _extract_prices(values2)
                 if not ticker:
                     ticker = _extract_ticker(values2)
             except Exception:
                 pass
 
-    # Strategy 2: fall back to fundamentals from the organization
     if not prices:
-        org_neid = _find_organization_with_data(entity_name)
-        if org_neid:
-            try:
-                values3 = _fetch_properties([org_neid], timeout=15.0)
-                fundamentals = _extract_fundamentals(values3)
-                if not ticker:
-                    ticker = _extract_ticker(values3)
-            except Exception:
-                pass
-
-    if not prices and not fundamentals:
-        return f"No stock price data found for '{entity_name}'.", {}
+        hint = " Try get_fundamentals for financial statement data." if ticker else ""
+        return f"No OHLCV price data found for '{entity_name}'.{hint}", {}
 
     full_data: dict = {}
-    parts = []
-
     if ticker:
         full_data["ticker"] = ticker
-    if prices:
-        full_data["prices"] = prices
-        dates = [p["date"] for p in prices if p.get("date")]
-        closes = [p.get("close") for p in prices if p.get("close") is not None]
-        date_range = f"{min(dates)} to {max(dates)}" if dates else "unknown"
-        price_range = f"${min(closes):.2f} – ${max(closes):.2f}" if closes else "unknown"
-        parts.append(
-            f"Found {len(prices)} OHLCV data point(s) for '{entity_name}'"
-            + (f" (ticker: {ticker})" if ticker else "")
-            + f". Date range: {date_range}. Close price range: {price_range}."
-        )
-    if fundamentals:
-        full_data["fundamentals"] = fundamentals
-        parts.append(
-            f"Financial fundamentals: revenue=${fundamentals.get('total_revenue', '?')}, "
-            f"net_income=${fundamentals.get('net_income', '?')}, "
-            f"shares_outstanding={fundamentals.get('shares_outstanding', '?')}."
-        )
+    full_data["prices"] = prices
+    dates = [p["date"] for p in prices if p.get("date")]
+    closes = [p.get("close") for p in prices if p.get("close") is not None]
+    date_range = f"{min(dates)} to {max(dates)}" if dates else "unknown"
+    price_range = f"${min(closes):.2f} – ${max(closes):.2f}" if closes else "unknown"
 
-    return " ".join(parts), full_data
+    return (
+        f"Found {len(prices)} OHLCV data point(s) for '{entity_name}'"
+        + (f" (ticker: {ticker})" if ticker else "")
+        + f". Date range: {date_range}. Close price range: {price_range}."
+    ), full_data
 
 
-def _exec_get_filings(entity_name: str, neid: str) -> tuple[str, dict]:
-    """Fetch SEC filings."""
+def _exec_get_fundamentals(entity_name: str, neid: str) -> tuple[str, dict]:
+    """Fetch financial fundamentals (revenue, net income, EPS, etc.) from filings.
+
+    Separate from stock prices — use this for valuation and financial analysis.
+    """
     _load_schema()
+    fundamental_pids = _resolve_pids(list(_FILING_FIELDS) + ["ticker_symbol", "ticker"])
+
+    try:
+        values = _fetch_properties([neid], pids=fundamental_pids, timeout=10.0)
+        fundamentals = _extract_fundamentals(values)
+        ticker = _extract_ticker(values)
+
+        if not fundamentals:
+            org_neid = _find_organization_with_data(entity_name)
+            if org_neid and org_neid != neid:
+                values2 = _fetch_properties([org_neid], pids=fundamental_pids, timeout=10.0)
+                fundamentals = _extract_fundamentals(values2)
+                if not ticker:
+                    ticker = _extract_ticker(values2)
+
+        if not fundamentals:
+            return f"No financial fundamentals found for '{entity_name}'.", {}
+
+        full_data: dict = {"fundamentals": fundamentals}
+        if ticker:
+            full_data["ticker"] = ticker
+
+        parts = [f"Financial fundamentals for '{entity_name}':"]
+        for k, v in list(fundamentals.items())[:8]:
+            parts.append(f"{k}={v}")
+        return " ".join(parts), full_data
+    except Exception as e:
+        return f"Error fetching fundamentals for '{entity_name}': {e}", {}
+
+
+def _exec_get_filings(
+    entity_name: str, neid: str, form_types: list[str] | None = None, limit: int = 20,
+) -> tuple[str, dict]:
+    """Fetch SEC filings, optionally filtered by form type."""
+    _load_schema()
+    filing_pids = _resolve_pids(list(_FILING_FIELDS) + ["name"])
 
     try:
         linked_expr = json.dumps({
             "type": "linked",
             "linked": {"to_entity": neid, "distance": 1, "direction": "incoming"},
         })
+        find_limit = min(limit * 2, 60)
         resp = elemental_client.post(
             "/elemental/find",
-            data={"expression": linked_expr, "limit": "30"},
+            data={"expression": linked_expr, "limit": str(find_limit)},
         )
         resp.raise_for_status()
         eids = resp.json().get("eids", [])
         if not eids:
             return f"No filings found for '{entity_name}'.", {}
 
-        values = _fetch_properties_batched(eids[:20], timeout=10.0)
+        max_eids = min(len(eids), limit + 5)
+        values = _fetch_properties_batched(eids[:max_eids], pids=filing_pids, timeout=10.0)
         filings = _extract_filings(values)
 
-        if not filings:
-            return f"No SEC filing data found for '{entity_name}'.", {}
+        if form_types:
+            ft_upper = {ft.upper() for ft in form_types}
+            filings = [f for f in filings if f.get("form_type", "").upper() in ft_upper]
 
-        form_types = list({f.get("form_type", "?") for f in filings})
+        filings = filings[:limit]
+
+        if not filings:
+            filter_str = f" (filtered to: {', '.join(form_types)})" if form_types else ""
+            return f"No SEC filing data found for '{entity_name}'{filter_str}.", {}
+
+        found_types = list({f.get("form_type", "?") for f in filings})
         dates = [f["date"] for f in filings if f.get("date")]
         date_range = f"{min(dates)} to {max(dates)}" if dates else "unknown"
 
         return (
             f"Found {len(filings)} filing(s) for '{entity_name}'. "
-            f"Form types: {', '.join(form_types)}. Date range: {date_range}."
+            f"Form types: {', '.join(found_types)}. Date range: {date_range}."
         ), {"filings": filings}
     except Exception as e:
         return f"Error fetching filings for '{entity_name}': {e}", {}
 
 
-def _exec_get_events(entity_name: str, neid: str) -> tuple[str, dict]:
-    """Fetch events."""
+def _exec_get_events(entity_name: str, neid: str, limit: int = 20) -> tuple[str, dict]:
+    """Fetch corporate events linked to an entity."""
     _load_schema()
+    event_pids = _resolve_pids(list(_EVENT_FIELDS) + ["alias"])
 
     try:
         linked_expr = json.dumps({
             "type": "linked",
             "linked": {"to_entity": neid, "distance": 1, "direction": "incoming"},
         })
+        find_limit = min(limit * 2, 60)
         resp = elemental_client.post(
             "/elemental/find",
-            data={"expression": linked_expr, "limit": "30"},
+            data={"expression": linked_expr, "limit": str(find_limit)},
         )
         resp.raise_for_status()
         eids = resp.json().get("eids", [])
         if not eids:
             return f"No events found for '{entity_name}'.", {}
 
-        values = _fetch_properties_batched(eids[:20], timeout=10.0)
+        max_eids = min(len(eids), limit + 5)
+        values = _fetch_properties_batched(eids[:max_eids], pids=event_pids, timeout=10.0)
         events = _extract_events(values)
+        events = events[:limit]
 
         if not events:
             return f"No event data found for '{entity_name}'.", {}
@@ -751,32 +892,37 @@ def _exec_get_events(entity_name: str, neid: str) -> tuple[str, dict]:
         return f"Error fetching events for '{entity_name}': {e}", {}
 
 
-def _exec_get_relationships(entity_name: str, neid: str) -> tuple[str, dict]:
-    """Fetch related entities."""
+def _exec_get_relationships(
+    entity_name: str, neid: str, direction: str = "both", limit: int = 20,
+) -> tuple[str, dict]:
+    """Fetch related entities with controllable direction and limit."""
+    if direction not in ("incoming", "outgoing", "both"):
+        direction = "both"
     try:
         linked_expr = json.dumps({
             "type": "linked",
-            "linked": {"to_entity": neid, "distance": 1, "direction": "both"},
+            "linked": {"to_entity": neid, "distance": 1, "direction": direction},
         })
         resp = elemental_client.post(
             "/elemental/find",
-            data={"expression": linked_expr, "limit": "50"},
+            data={"expression": linked_expr, "limit": str(min(limit * 2, 100))},
         )
         resp.raise_for_status()
         eids = resp.json().get("eids", [])
         if not eids:
-            return f"No related entities found for '{entity_name}'.", {}
+            return f"No related entities found for '{entity_name}' (direction={direction}).", {}
 
+        fetch_count = min(len(eids), limit)
         names_resp = elemental_client.post(
             "/entities/names",
-            json={"neids": eids[:30]},
+            json={"neids": eids[:fetch_count]},
             timeout=10.0,
         )
         names_resp.raise_for_status()
         names_map = names_resp.json().get("results", {})
 
         relationships = []
-        for eid in eids[:30]:
+        for eid in eids[:fetch_count]:
             name = names_map.get(eid, eid)
             relationships.append({"neid": eid, "name": name})
 
@@ -793,65 +939,56 @@ def _exec_get_relationships(entity_name: str, neid: str) -> tuple[str, dict]:
         return f"Error fetching relationships for '{entity_name}': {e}", {}
 
 
-def _exec_get_entity_properties(entity_name: str, neid: str) -> tuple[str, dict]:
-    """Fetch all properties for an entity."""
-    _load_schema()
-
-    try:
-        values = _fetch_properties([neid], include_attrs=True)
-        unique_pids = list({v.get("pid") for v in values})
-        prop_names = sorted({_pname(pid) for pid in unique_pids if _pname(pid)})[:15]
-
-        return (
-            f"Found {len(values)} property value(s) for '{entity_name}' "
-            f"across {len(unique_pids)} unique properties. "
-            f"Properties: {', '.join(prop_names) if prop_names else '(PIDs not in schema)'}."
-        ), {"properties": values, "property_names": prop_names}
-    except Exception as e:
-        return f"Error fetching properties for '{entity_name}': {e}", {}
-
-
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 
 _EXECUTORS = {
+    "search_entities": _exec_search_entities,
+    "get_properties": _exec_get_properties,
     "get_news": _exec_get_news,
     "get_stock_prices": _exec_get_stock_prices,
+    "get_fundamentals": _exec_get_fundamentals,
     "get_filings": _exec_get_filings,
     "get_events": _exec_get_events,
     "get_relationships": _exec_get_relationships,
-    "get_entity_properties": _exec_get_entity_properties,
 }
 
-
 _REQUIRED_PARAMS: dict[str, list[str]] = {
+    "search_entities": ["query"],
+    "get_properties": ["entity_name", "neid"],
     "get_news": ["entity_name", "neid"],
     "get_stock_prices": ["entity_name", "neid"],
+    "get_fundamentals": ["entity_name", "neid"],
     "get_filings": ["entity_name", "neid"],
     "get_events": ["entity_name", "neid"],
     "get_relationships": ["entity_name", "neid"],
-    "get_entity_properties": ["entity_name", "neid"],
 }
 
 
 def _dispatch_call(call: dict) -> tuple[str, dict]:
-    """Execute a single API call spec. Returns (summary, full_data)."""
+    """Execute a single API call spec. Returns (summary, full_data).
+
+    Filters params to only those accepted by the executor's signature,
+    so the planner can freely pass optional params without crashing.
+    """
     call_type = call.get("type", "")
     executor = _EXECUTORS.get(call_type)
     if not executor:
-        return f"Unknown call type: {call_type}", {}
+        available = ", ".join(_EXECUTORS.keys())
+        return f"Unknown call type: {call_type}. Available: {available}", {}
     params = call.get("params", {})
     required = _REQUIRED_PARAMS.get(call_type, [])
     missing = [p for p in required if not params.get(p)]
     if missing:
         return (
-            f"Missing required parameter(s) {missing} for {call_type}. "
-            f"All calls require entity_name and neid from query.entities.",
+            f"Missing required parameter(s) {missing} for {call_type}.",
             {},
         )
+    accepted = set(inspect.signature(executor).parameters.keys())
+    filtered = {k: v for k, v in params.items() if k in accepted}
     try:
-        return executor(**params)
+        return executor(**filtered)
     except Exception as e:
         return f"Error: {e}", {}
 
@@ -943,8 +1080,9 @@ Return a JSON object with one of these two structures:
     "action": "research",
     "reasoning": "Brief explanation of what you need and why",
     "calls": [
-        {"type": "get_news", "params": {"entity_name": "Netflix", "neid": "07456007231444618110"}},
-        {"type": "get_stock_prices", "params": {"entity_name": "Disney", "neid": "..."}}
+        {"type": "get_news", "params": {"entity_name": "Netflix", "neid": "...", "limit": 10}},
+        {"type": "get_stock_prices", "params": {"entity_name": "Disney", "neid": "..."}},
+        {"type": "get_properties", "params": {"entity_name": "Apple", "neid": "...", "properties": ["ticker_symbol", "industry", "sector"]}}
     ]
 }
 
@@ -956,63 +1094,93 @@ Return a JSON object with one of these two structures:
 
 ## Available API calls
 
-### get_news(entity_name, neid)
-Fetches recent news articles linked to the entity. Returns article count, date range,
-average sentiment score (-1 to 1), and per-article data (title, date, sentiment, source,
-tone). Use for sentiment context, recent developments, or market reaction.
-Typically returns 5-20 articles.
+All calls accept optional parameters to control scope and cost. Use them.
+
+### search_entities(query, flavors?, max_results?)
+Search for entities by name. Returns matching NEIDs, names, flavors, and match scores.
+Use to discover entities not in the original query — e.g. find a company's
+financial_instrument entity to get stock data, or find competitors.
+- **query** (required): search term (company name, ticker, etc.)
+- **flavors** (optional list): filter by entity type, e.g. ["organization", "financial_instrument"]
+- **max_results** (optional int, default 5): cap on results
+
+### get_properties(entity_name, neid, properties?, limit?)
+Fetch specific named properties for an entity. Much cheaper than a full property dump.
+- **entity_name** (required): human-readable name
+- **neid** (required): entity NEID
+- **properties** (optional list): property names to fetch, e.g. ["ticker_symbol", "industry",
+  "sector", "company_cik"]. Omit to fetch all (expensive — avoid when possible).
+- **limit** (optional int, default 10): max values per property (for time-series properties)
+
+Common property names: ticker_symbol, ticker, company_cik, industry, sector, market_cap,
+exchange, country, description, website, employees, founded_date.
+
+### get_news(entity_name, neid, limit?)
+Fetches news articles linked to the entity. Returns article count, date range,
+average sentiment score (-1 to 1), and per-article data (title, date, sentiment, source, tone).
+- **limit** (optional int, default 15): max articles to return. Use 5-10 for quick context,
+  15-20 for deep analysis.
 
 ### get_stock_prices(entity_name, neid)
-Fetches OHLCV stock price history or financial fundamentals. For most companies returns
-daily price data (open/high/low/close/volume) with date ranges and ticker symbol. For very
-large entities (mega-cap stocks), OHLCV may time out and fall back to financial fundamentals
-(revenue, net income, EPS, shares outstanding) from SEC filings.
-Always returns ticker when available. Use for any price-related or valuation claim.
+Fetches OHLCV stock price history. Returns daily data (open/high/low/close/volume) with
+date range and ticker symbol. If prices aren't available, suggests using get_fundamentals.
+Use for price trends, volatility, or correlation analysis.
 
-### get_filings(entity_name, neid)
-Fetches SEC filings: 10-K, 10-Q, 8-K, Form 4, SC 13G, etc. Returns form type, filing date,
-accession number, description. For Form 4 (insider trading), also returns transaction type
-and shares transacted. Use for corporate governance, insider activity, or financial reporting.
+### get_fundamentals(entity_name, neid)
+Fetches financial statement data: total_revenue, net_income, total_assets,
+total_liabilities, shareholders_equity, shares_outstanding, eps_basic, eps_diluted.
+Separate from stock prices. Use for valuation, financial health, or earnings analysis.
+If the entity is a financial_instrument, use search_entities to find the parent organization
+first, then call get_fundamentals on the organization NEID.
 
-### get_events(entity_name, neid)
-Fetches corporate events: mergers & acquisitions, product launches, lawsuits, leadership
-changes, regulatory actions, analyst reports. Returns event category, description, date,
-likelihood. Use for catalysts, corporate actions, or market-moving events.
+### get_filings(entity_name, neid, form_types?, limit?)
+Fetches SEC filings linked to the entity.
+- **form_types** (optional list): filter by form type, e.g. ["10-K", "10-Q"] or ["Form 4"].
+  Omit to fetch all types.
+- **limit** (optional int, default 20): max filings to return.
+Returns form type, filing date, accession number, description. For Form 4 insider trades,
+also returns transaction_type and shares_transacted.
 
-### get_relationships(entity_name, neid)
-Discovers entities linked to the given entity (competitors, subsidiaries, investors,
-partners). Returns a list of related entity names and NEIDs. Use to find additional
-entities worth investigating — e.g. find competitors for industry-trend theses.
+### get_events(entity_name, neid, limit?)
+Fetches corporate events: mergers, product launches, lawsuits, leadership changes,
+regulatory actions, analyst reports. Returns category, description, date, likelihood.
+- **limit** (optional int, default 20): max events.
 
-### get_entity_properties(entity_name, neid)
-Raw property dump for an entity. Returns property count and names (e.g. ticker,
-company_cik, industry, sector). Use as diagnostic/exploration when other calls don't
-return expected data, or to understand what data is available for an unfamiliar entity.
+### get_relationships(entity_name, neid, direction?, limit?)
+Discovers entities linked to the given entity.
+- **direction** (optional, default "both"): "incoming", "outgoing", or "both".
+  "incoming" finds entities that link TO this one (filings, events, articles about it).
+  "outgoing" finds entities this one links TO (subsidiaries, investors).
+- **limit** (optional int, default 20): max related entities to return.
 
 ## Strategy
 
-- **Start broad**: First iteration should cover all entities with their primary data needs
-  (news + stock prices for most financial theses).
+- **Be precise about what you fetch**: Use the `properties` parameter on get_properties
+  and `form_types`/`limit` on other calls to avoid overfetching. Every parameter you
+  specify reduces cost and latency.
+- **Start broad**: First iteration should cover all entities with their primary data needs.
+  Match data_needs categories to call types: "market_data" → get_stock_prices,
+  "fundamentals" → get_fundamentals, "sentiment" → get_news, "filings" → get_filings,
+  "events" → get_events.
 - **Use `data_needs`**: The query rewrite identified relevant categories. Cover all of them.
 - **Batch calls**: Request multiple calls per iteration. Don't request one at a time.
-- **Follow up on thin results**: If a call returns 0 results or errors, try
-  `get_relationships` to find related entities, or `get_entity_properties` to understand
-  what exists.
-- **NEIDs are mandatory**: Every call requires both `entity_name` and `neid`. You can
-  ONLY use NEIDs from `query.entities`. Never omit the `neid` param, never fabricate one.
-  If an entity isn't in the query, you cannot fetch data for it directly — use
-  `get_relationships` on a known entity to discover related NEIDs first.
-- **Don't over-fetch**: 3-4 iterations is typical. If you have news, prices, and events
-  for all entities in the query, that's usually enough.
+- **Use search_entities for discovery**: If you need an entity not in query.entities
+  (e.g. a financial_instrument for stock prices, or a competitor), use search_entities
+  first. Then use the returned NEID in subsequent calls.
+- **Follow up on thin results**: If a call returns 0 results, try get_properties with
+  a few diagnostic properties (["ticker_symbol", "company_cik", "industry"]) to understand
+  what data exists. Or use get_relationships to find related entities.
+- **NEIDs are mandatory for entity calls**: get_properties, get_news, get_stock_prices,
+  get_fundamentals, get_filings, get_events, get_relationships all require entity_name
+  and neid. Use NEIDs from query.entities or from search_entities results.
+  Never fabricate a NEID.
+- **Don't over-fetch**: 3-4 iterations is typical. Use limits and filters.
 - **Error handling**: If a call errors, note it and move on. Never retry the exact same
-  call with the same params — it will fail the same way. If multiple calls fail for the
-  same entity (e.g. invalid NEID, 400 errors), that entity's data is unavailable — do
-  NOT keep retrying.
-- **Know when to stop**: If you've collected data for all entities that have valid NEIDs
-  and further calls keep failing, say "done" with what you have. The report agent can work
-  with partial data. Spinning on unresolvable errors wastes iterations.
-- **Say "done"** when you have sufficient evidence to address every claim in the thesis,
-  or after exhausting useful avenues.
+  call — it will fail the same way. If multiple calls fail for an entity, that entity's
+  data is unavailable.
+- **Know when to stop**: Say "done" when you have sufficient evidence to address every
+  claim in the thesis, or after exhausting useful avenues. The report agent can work
+  with partial data.
 """
 
 
