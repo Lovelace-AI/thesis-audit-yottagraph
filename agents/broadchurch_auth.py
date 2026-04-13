@@ -143,11 +143,8 @@ def get_auth_headers() -> dict[str, str]:
 import logging
 
 _log = logging.getLogger("elemental_client")
-if not _log.handlers and not _log.parent.handlers:
-    _handler = logging.StreamHandler()
-    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s", datefmt="%H:%M:%S"))
-    _log.addHandler(_handler)
 _log.setLevel(logging.DEBUG)
+_log.propagate = True
 
 SLOW_THRESHOLD_S = 5.0
 

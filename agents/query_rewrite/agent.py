@@ -91,7 +91,7 @@ Return ONLY a JSON object (no markdown fences, no explanation) with:
 """
 
 root_agent = Agent(
-    model="gemini-2.0-flash",
+    model="gemini-2.5-flash",
     name="query_rewrite",
     instruction=INSTRUCTION,
     tools=[],

@@ -1229,7 +1229,7 @@ def _call_planner_llm(research_doc_json: str) -> dict:
 
     client = genai.Client(vertexai=True, project=project, location=region)
     response = client.models.generate_content(
-        model="gemini-2.0-flash",
+        model="gemini-2.5-pro",
         contents=research_doc_json,
         config=types.GenerateContentConfig(
             system_instruction=_load_planner_instruction(),
@@ -1371,7 +1371,7 @@ try:
     from google.adk.agents import Agent
 
     root_agent = Agent(
-        model="gemini-2.0-flash",
+        model="gemini-2.5-flash",
         name="researcher",
         instruction=WRAPPER_INSTRUCTION,
         tools=[research_iteration],
