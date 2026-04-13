@@ -113,13 +113,11 @@ recover from the observed errors.
 You are not limited to iterating on the latest prompt. You can base your changes
 on ANY prompt from `score_history` by setting `base_prompt_id` in your output.
 
-Consider branching when:
-- The latest iteration's score dropped significantly (e.g., 5+ points) compared
-  to the best-ever score. The regression may mean the last change was harmful,
-  and iterating on top of it may compound the problem.
-- A plateau has persisted across several iterations on the current branch.
-  Going back to an earlier high-scoring prompt and trying a different optimization
-  direction may break through.
+**When to branch:** Do NOT branch after a single bad iteration. Stay on the
+current branch and try to recover unless the last 3 or more consecutive
+iterations have ALL scored 5+ points below the best score ever seen. A single
+score drop is often temporary — keep iterating forward. Only abandon a branch
+when there is sustained evidence that the direction is not working.
 
 When you decide to branch:
 - Set `base_prompt_id` to the `prompt_id` of the prompt you want to branch from
@@ -128,10 +126,6 @@ When you decide to branch:
   starting point — modify it and return the result as `prompt_json`.
 - Your `change_description` should note the revert, e.g., "Reverted to prompt 3
   and tried a different approach to skill_market."
-
-This is a soft heuristic, not a hard rule. Use your judgment — sometimes a score
-drop is temporary and the next forward iteration will recover. But if the drop is
-large or the direction seems clearly wrong, branching is the better choice.
 
 ## Rules
 
