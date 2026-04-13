@@ -154,7 +154,7 @@ def score_research(query: dict, research_doc: dict) -> ScoreResult:
     if len(scorer_input) > 200_000:
         scorer_input = scorer_input[:200_000] + '..."}'
 
-    SCORER_MODEL = "gemini-3.1-flash-lite"
+    SCORER_MODEL = "gemini-2.5-flash-lite"
     log.info(f"Scorer LLM call starting (model={SCORER_MODEL}, input {len(scorer_input):,} chars)")
 
     t_client = time.monotonic()

@@ -136,7 +136,7 @@ def _call_learner_llm(
         "plateau_detected": plateau_detected,
     })
 
-    LEARNER_MODEL = "gemini-3.1-flash"
+    LEARNER_MODEL = "gemini-2.5-flash"
     log.info(
         f"Learner LLM call starting (model={LEARNER_MODEL}, highest_impact={highest_impact}, "
         f"plateau={plateau_detected}, history={len(score_history)} entries, "

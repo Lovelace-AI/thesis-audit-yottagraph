@@ -66,7 +66,7 @@ explanation) with exactly these fields:
 """
 
 root_agent = Agent(
-    model="gemini-3.1-flash-lite",
+    model="gemini-2.5-flash-lite",
     name="report",
     instruction=INSTRUCTION,
     tools=[],

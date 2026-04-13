@@ -59,7 +59,7 @@ class _TimedLLMResult:
     generate_s: float
 
 
-PLANNER_MODEL = "gemini-3.1-flash-lite"
+PLANNER_MODEL = "gemini-2.5-flash-lite"
 
 
 def _call_planner(research_doc_json: str, instruction: str) -> _TimedLLMResult:
