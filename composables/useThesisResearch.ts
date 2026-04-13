@@ -175,19 +175,6 @@ export function useThesisResearch() {
                 else if (name === 'researcher') agentIds.value.researcher = a.engine_id;
                 else if (name === 'report') agentIds.value.report = a.engine_id;
             }
-
-            // Fallback: if the old single agent is deployed, use it for all
-            if (!agentIds.value.queryRewrite && !agentIds.value.researcher) {
-                const legacy = agents.find(
-                    (a: any) =>
-                        a.name === 'thesis_researcher' || a.display_name === 'thesis_researcher'
-                );
-                if (legacy?.engine_id) {
-                    agentIds.value.queryRewrite = legacy.engine_id;
-                    agentIds.value.researcher = legacy.engine_id;
-                    agentIds.value.report = legacy.engine_id;
-                }
-            }
         } catch {
             // Gateway not available
         }

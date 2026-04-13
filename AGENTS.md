@@ -114,10 +114,8 @@ If these directories are missing, run `/update_instructions` to reinstall.
 
 ### Agents
 
-`agents/example_agent/` is a working starter agent that queries the Elemental
-Knowledge Graph. It includes schema discovery, entity search, property lookup,
-and optional MCP server integration. Use it as a starting point — customize the
-instruction, add tools, and see the `agents` cursor rule for the full guide.
+The `agents/` directory contains the production agents: `query_rewrite`,
+`researcher`, and `report`. See the `agents` cursor rule for the full guide.
 
 ## Configuration
 
