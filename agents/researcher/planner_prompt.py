@@ -38,7 +38,6 @@ Return a JSON object with one of these two structures:
     "reasoning": "Brief explanation of what you need and why",
     "calls": [
         {"type": "get_news", "params": {"entity_name": "Netflix", "neid": "...", "limit": 10}},
-        {"type": "get_stock_prices", "params": {"entity_name": "Disney", "neid": "..."}},
         {"type": "get_properties", "params": {"entity_name": "Apple", "neid": "...", "properties": ["ticker_symbol", "industry", "sector"]}}
     ]
 }
@@ -70,13 +69,6 @@ Fetch specific named properties for an entity.
 Fetches news articles linked to the entity. Returns article count, date range,
 and per-article data (title, date, source, tone).
 - **limit** (optional int, default 15): max articles to return.
-
-### get_stock_prices(entity_name, neid)
-Fetches OHLCV stock price history. Returns daily data with date range and ticker.
-
-### get_fundamentals(entity_name, neid)
-Fetches financial statement data: total_revenue, net_income, total_assets,
-total_liabilities, shareholders_equity, shares_outstanding, eps_basic, eps_diluted.
 
 ### get_filings(entity_name, neid, form_types?, limit?)
 Fetches SEC filings linked to the entity.
@@ -112,7 +104,8 @@ ARTIFACT_KEYS = frozenset([
 
 _DEFAULT_STRATEGY = """\
 - Map each item in `data_needs` to the appropriate call types: \
-"market_data" → get_stock_prices, "fundamentals" → get_fundamentals, \
+"market_data" → get_properties on financial_instrument (see skill_market), \
+"fundamentals" → get_properties with financial fields (see skill_fundamentals), \
 "news" → get_news, "filings" → get_filings, "events" → get_events.
 - Start broad: first iteration should cover all entities with their primary data needs.
 - Batch calls: request multiple calls per iteration rather than one at a time.
@@ -163,59 +156,83 @@ no 8-K filing was made. Use `get_news` for broader event coverage.
 ### Common patterns
 - Compare filing dates and types across entities to identify event timing.
 - Use Form 4 data to assess insider confidence (buying vs selling).
-- After finding filings, use `get_fundamentals` to get the financial data from them.\
+- After finding filings, use `get_properties` to get the financial data from them.\
 """
 
 _DEFAULT_SKILL_FUNDAMENTALS = """\
 ## Skill: Financial Fundamentals
 
-**Calls**: get_fundamentals, get_properties
+**Calls**: get_properties, search_entities
 
-### Usage
-- `get_fundamentals` is the default way to fetch core financial metrics: revenue, \
-net income, assets, liabilities, equity, shares outstanding, EPS.
-- It works best on organization entities that file with the SEC (have a CIK).
-- If `get_fundamentals` returns empty, the entity may not be an SEC filer. \
-Try `get_properties` with ["company_cik", "ticker_symbol"] to check.
+### Key concept: fundamentals live on organization entities
+
+Financial statement data (revenue, net income, EPS, etc.) is stored on \
+`organization` entities that file with the SEC (have a CIK number).
+
+### How to fetch fundamentals
+
+1. Check entity type in query.entities.
+   - If `organization`: go to step 2.
+   - If `financial_instrument`: use `search_entities` to find the parent \
+organization, then proceed to step 2.
+2. Fetch fundamentals:
+   `get_properties` on the organization NEID with \
+`properties: ["total_revenue", "net_income", "total_assets", \
+"total_liabilities", "shareholders_equity", "shares_outstanding", \
+"eps_basic", "eps_diluted"]`
+
+### Important
+
+- Do NOT expect fundamentals on `financial_instrument` entities. \
+They live on the parent `organization`.
+- If `get_properties` returns empty for these fields, the entity may not \
+be an SEC filer. Check with `get_properties` using `["company_cik", \
+"ticker_symbol"]` to verify.
+- For FDIC-regulated banks, financial data may use different property \
+names than standard EDGAR fields. Use `get_properties` without a \
+specific property list to explore.
 
 ### Deeper data
-- For XBRL-specific fields beyond the standard set, use `get_properties` with \
-explicit property names.
-- For FDIC-regulated banks, financial data may live in different properties than \
-standard EDGAR fields. Use `get_properties` to explore.
-
-### Entity-type issues
-- If the entity is a `financial_instrument`, use `search_entities` to find the \
-parent `organization` first, then call `get_fundamentals` on the organization NEID.
-- Banks and financial institutions may have different property coverage than \
-typical EDGAR filers.\
+- For XBRL-specific fields beyond the standard set, use `get_properties` \
+with explicit property names.\
 """
 
 _DEFAULT_SKILL_MARKET = """\
 ## Skill: Stock & Market Data
 
-**Calls**: get_stock_prices, get_properties, search_entities
+**Calls**: get_properties, search_entities
 
-### Usage
-- `get_stock_prices` is the default way to fetch OHLCV data. It handles ticker \
-lookup and financial_instrument entity resolution internally.
-- Market data fundamentally lives on `financial_instrument` entities, but \
-`get_stock_prices` can be called on an organization NEID and will attempt to \
-find the associated instrument.
+### Key concept: OHLCV data lives on financial_instrument entities
 
-### Follow-up patterns
-- If `get_stock_prices` returns empty, check whether the entity has a ticker: \
-`get_properties` with ["ticker_symbol", "ticker"].
-- Use `search_entities` with `flavors: ["financial_instrument"]` to find the \
-correct instrument entity for a given ticker.
-- For listing metadata (exchange, market cap), use `get_properties` on the \
-financial_instrument entity.
+Stock price properties (`close_price`, `open_price`, `high_price`, `low_price`, \
+`trading_volume`) are stored on `financial_instrument` entities, NOT on \
+`organization` entities.
+
+### How to fetch stock prices
+
+1. Check entity type in query.entities.
+   - If `financial_instrument`: go to step 3.
+   - If `organization`: go to step 2.
+2. Resolve organization to financial instrument:
+   a. `get_properties` with `properties: ["ticker_symbol", "ticker"]` on the org NEID.
+   b. `search_entities` with the ticker and `flavors: ["financial_instrument"]`.
+3. Fetch OHLCV data:
+   `get_properties` on the financial_instrument NEID with \
+`properties: ["close_price", "open_price", "high_price", "low_price", "trading_volume"]` \
+and `limit: 180` (for ~6 months of daily data).
+
+### Important
+
+- Do NOT call `get_properties` with price properties on an organization NEID. \
+It will return nothing and waste an iteration.
+- Use `limit: 180` (or higher) for price properties. The default limit of 10 \
+would return only 10 trading days.
+- If no ticker is found on the org, the company likely has no market data. \
+Note this and move on.
 
 ### FRED macro data
-- FRED economic series (GDP, CPI, unemployment) are stored as separate entities \
-in the KG, NOT as properties of organizations.
-- Use `search_entities` to find a FRED series, then `get_properties` to fetch values.
-- FRED data has different property names than equity OHLCV data.\
+- FRED economic series (GDP, CPI, unemployment) are stored as separate entities.
+- Use `search_entities` to find a FRED series, then `get_properties` to fetch values.\
 """
 
 _DEFAULT_SKILL_NEWS = """\

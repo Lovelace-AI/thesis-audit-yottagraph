@@ -42,7 +42,6 @@ _pid_to_name: dict[int, str] = {}
 _name_to_pid: dict[str, int] = {}
 _schema_loaded = False
 
-_PRICE_FIELDS = ("open_price", "high_price", "low_price", "close_price", "trading_volume")
 _FILING_FIELDS = (
     "accession_number", "form_type", "filing_date", "total_revenue", "net_income",
     "total_assets", "total_liabilities", "shareholders_equity", "shares_outstanding",
@@ -55,12 +54,11 @@ _EVENT_FIELDS = (
 _NEWS_FIELDS = ("title", "original_publication_name", "tone")
 
 _TICKER_PIDS: set[int] = set()
-_PRICE_PIDS: set[int] = set()
 
 
 def _load_schema() -> None:
     """Fetch the KG schema and build PID↔name maps. Idempotent."""
-    global _schema_loaded, _TICKER_PIDS, _PRICE_PIDS
+    global _schema_loaded, _TICKER_PIDS
     if _schema_loaded:
         return
     try:
@@ -77,7 +75,6 @@ def _load_schema() -> None:
             _name_to_pid.get("ticker_symbol", 0),
             _name_to_pid.get("ticker", 0),
         } - {0}
-        _PRICE_PIDS = {_name_to_pid[n] for n in _PRICE_FIELDS if n in _name_to_pid}
     except Exception:
         pass
     _schema_loaded = True
@@ -166,162 +163,9 @@ def _extract_ticker(values: list[dict]) -> str | None:
     return None
 
 
-def _find_financial_instrument(ticker: str) -> str | None:
-    """Search for a financial_instrument entity by ticker symbol."""
-    try:
-        resp = elemental_client.post(
-            "/entities/search",
-            json={
-                "queries": [{"queryId": 1, "query": ticker, "flavors": ["financial_instrument"]}],
-                "maxResults": 5,
-                "includeNames": True,
-                "includeFlavors": True,
-                "includeScores": True,
-                "minScore": 0.5,
-            },
-            timeout=10.0,
-        )
-        resp.raise_for_status()
-        matches = resp.json().get("results", [{}])[0].get("matches", [])
-        exact = [m for m in matches if m.get("name", "").upper() == ticker.upper()]
-        if exact:
-            return exact[0]["neid"]
-        for m in matches:
-            if m.get("flavor") == "financial_instrument":
-                return m["neid"]
-    except Exception:
-        pass
-    return None
-
-
-def _find_organization(name: str) -> str | None:
-    """Search for an organization entity by name."""
-    candidates = [name]
-    lower = name.lower().rstrip(".")
-    if not any(s in lower for s in ("inc", "corp", "ltd", "llc", "co.", "company")):
-        candidates.append(f"{name} Inc")
-
-    for query in candidates:
-        try:
-            resp = elemental_client.post(
-                "/entities/search",
-                json={
-                    "queries": [{"queryId": 1, "query": query, "flavors": ["organization"]}],
-                    "maxResults": 3,
-                    "includeNames": True,
-                    "includeFlavors": True,
-                    "includeScores": True,
-                    "minScore": 0.5,
-                },
-                timeout=10.0,
-            )
-            resp.raise_for_status()
-            matches = resp.json().get("results", [{}])[0].get("matches", [])
-            if matches and matches[0].get("score", 0) >= 0.8:
-                return matches[0]["neid"]
-        except Exception:
-            pass
-    return None
-
-
-def _find_organization_with_data(name: str) -> str | None:
-    """Search for an organization entity that has EDGAR/financial data."""
-    candidates = [name]
-    lower = name.lower().rstrip(".")
-    if not any(s in lower for s in ("inc", "corp", "ltd", "llc", "co.", "company")):
-        candidates.append(f"{name} Inc")
-
-    all_matches: list[dict] = []
-    for query in candidates:
-        try:
-            resp = elemental_client.post(
-                "/entities/search",
-                json={
-                    "queries": [{"queryId": 1, "query": query, "flavors": ["organization"]}],
-                    "maxResults": 5,
-                    "includeNames": True,
-                    "includeFlavors": True,
-                    "includeScores": True,
-                    "minScore": 0.5,
-                },
-                timeout=10.0,
-            )
-            resp.raise_for_status()
-            matches = resp.json().get("results", [{}])[0].get("matches", [])
-            for m in matches:
-                if m.get("score", 0) >= 0.5 and m["neid"] not in {x["neid"] for x in all_matches}:
-                    all_matches.append(m)
-        except Exception:
-            pass
-
-    ticker_pid = _name_to_pid.get("ticker")
-    cik_pid = _name_to_pid.get("company_cik")
-
-    for m in all_matches[:5]:
-        neid = m["neid"]
-        try:
-            vals = _fetch_properties([neid], timeout=10.0)
-            has_data = any(
-                v.get("pid") in (ticker_pid, cik_pid)
-                for v in vals
-                if v.get("pid")
-            )
-            if has_data:
-                return neid
-        except Exception:
-            pass
-
-    if all_matches:
-        return all_matches[0]["neid"]
-    return None
-
-
-def _get_ticker_for_entity(neid: str) -> str | None:
-    """Try to get a ticker by querying the entity or its organization."""
-    try:
-        values = _fetch_properties([neid], timeout=10.0)
-        ticker = _extract_ticker(values)
-        if ticker:
-            return ticker
-    except Exception:
-        pass
-    try:
-        name_resp = elemental_client.get(f"/entities/{neid}/name", timeout=5.0)
-        name_resp.raise_for_status()
-        entity_name = name_resp.json().get("name", "")
-        org_neid = _find_organization(entity_name)
-        if org_neid and org_neid != neid:
-            org_values = _fetch_properties([org_neid], timeout=10.0)
-            return _extract_ticker(org_values)
-    except Exception:
-        pass
-    return None
-
-
 # ---------------------------------------------------------------------------
 # Extraction helpers
 # ---------------------------------------------------------------------------
-
-
-def _extract_fundamentals(values: list[dict]) -> dict:
-    """Extract financial fundamentals from an organization entity."""
-    latest: dict[str, tuple[str, any]] = {}
-    for v in values:
-        pname = _pname(v.get("pid", 0))
-        if not pname:
-            continue
-        recorded = v.get("recorded_at", "")
-        if pname in latest:
-            if recorded > latest[pname][0]:
-                latest[pname] = (recorded, v.get("value"))
-        else:
-            latest[pname] = (recorded, v.get("value"))
-
-    result: dict[str, any] = {}
-    for field in _FILING_FIELDS:
-        if field in latest:
-            result[field] = latest[field][1]
-    return result
 
 
 def _extract_news(values: list[dict]) -> list[dict]:
@@ -361,41 +205,6 @@ def _extract_news(values: list[dict]) -> list[dict]:
             })
     articles.sort(key=lambda a: a.get("date", ""), reverse=True)
     return articles
-
-
-def _extract_prices(values: list[dict]) -> list[dict]:
-    """Extract OHLCV price data using PID→name mapping."""
-    _load_schema()
-    price_field_map: dict[int, str] = {}
-    for name in _PRICE_FIELDS:
-        pid = _name_to_pid.get(name)
-        if pid is not None:
-            short = name.replace("_price", "").replace("trading_", "")
-            price_field_map[pid] = short
-
-    price_points: dict[str, dict] = {}
-    ticker = None
-    for v in values:
-        pid = v.get("pid")
-        val = v.get("value")
-        if pid in _TICKER_PIDS and val:
-            ticker = str(val)
-        field = price_field_map.get(pid)
-        if not field:
-            continue
-        recorded = v.get("recorded_at", "")
-        date_key = recorded[:10] if recorded else ""
-        if not date_key:
-            continue
-        if date_key not in price_points:
-            price_points[date_key] = {"date": date_key}
-        price_points[date_key][field] = val
-
-    result = sorted(price_points.values(), key=lambda p: p.get("date", ""), reverse=True)
-    for p in result:
-        if ticker:
-            p["ticker"] = ticker
-    return result
 
 
 def _extract_filings(values: list[dict]) -> list[dict]:
@@ -562,7 +371,7 @@ def _exec_get_properties(
     pids = _resolve_pids(properties)
 
     try:
-        values = _fetch_properties([neid], pids=pids, timeout=10.0)
+        values = _fetch_properties([neid], pids=pids, timeout=30.0)
         if limit and values:
             values = _limit_values_per_pid(values, limit)
 
@@ -622,187 +431,6 @@ def _exec_get_news(entity_name: str, neid: str, limit: int = 15) -> tuple[str, d
         ), {"articles": articles}
     except Exception as e:
         return f"Error fetching news for '{entity_name}': {_error_detail(e)}", {}
-
-
-def _get_mcp_bearer_token() -> str | None:
-    """Get a bearer token for Lovelace MCP servers (GCP service account only)."""
-    try:
-        import google.auth.transport.requests
-        import google.oauth2.id_token
-
-        request = google.auth.transport.requests.Request()
-        return google.oauth2.id_token.fetch_id_token(request, "queryserver:api")
-    except Exception:
-        return None
-
-
-def _call_mcp_tool(mcp_url: str, tool_name: str, arguments: dict) -> dict | None:
-    """Call an MCP tool and return the parsed result, or None on failure."""
-    token = _get_mcp_bearer_token()
-    if not token:
-        return None
-    try:
-        resp = httpx.post(
-            mcp_url,
-            json={
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "tools/call",
-                "params": {"name": tool_name, "arguments": arguments},
-            },
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            timeout=30.0,
-        )
-        if resp.status_code != 200:
-            return None
-        result = resp.json().get("result", {})
-        for item in result.get("content", []):
-            if item.get("type") == "text":
-                try:
-                    return json.loads(item["text"])
-                except (json.JSONDecodeError, TypeError):
-                    return {"text": item["text"]}
-        return result
-    except Exception:
-        return None
-
-
-_ELEMENTAL_MCP_URL = "https://mcp.news.prod.g.lovelace.ai/elemental/mcp"
-_STOCKS_MCP_URL = "https://mcp.news.prod.g.lovelace.ai/stocks/mcp"
-
-
-def _fetch_stock_prices_mcp(ticker: str, entity_name: str = "") -> list[dict]:
-    """Fetch OHLCV data via Lovelace MCP (avoids mega-entity timeouts)."""
-    # Try the stocks MCP first
-    for tool_name in ["stocks_get_prices", "get_prices", "get_stock_prices"]:
-        data = _call_mcp_tool(
-            _STOCKS_MCP_URL, tool_name, {"ticker": ticker, "range": "6m"}
-        )
-        if data:
-            if isinstance(data, list):
-                return data
-            if isinstance(data, dict) and "prices" in data:
-                return data["prices"]
-
-    # Try elemental MCP with history
-    entity_query = ticker or entity_name
-    if entity_query:
-        data = _call_mcp_tool(
-            _ELEMENTAL_MCP_URL,
-            "elemental_get_entity",
-            {
-                "entity": entity_query,
-                "flavor": "financial_instrument",
-                "properties": ["close_price", "open_price", "high_price", "low_price", "trading_volume"],
-                "history": {"limit": 180},
-            },
-        )
-        if data and isinstance(data, dict):
-            hist = data.get("historical_properties", {})
-            closes = hist.get("close_price", [])
-            if closes:
-                prices: list[dict] = []
-                for entry in closes:
-                    point: dict = {
-                        "date": (entry.get("recorded_at") or "")[:10],
-                        "close": entry.get("value"),
-                    }
-                    prices.append(point)
-                return prices
-    return []
-
-
-def _exec_get_stock_prices(entity_name: str, neid: str) -> tuple[str, dict]:
-    """Fetch OHLCV stock price data.
-
-    Tries: (1) OHLCV properties with PID filter, (2) MCP via ticker,
-    (3) financial_instrument entity search. Much cheaper than the old
-    waterfall because each step uses PID-filtered fetches.
-    """
-    _load_schema()
-    price_pids = _resolve_pids(list(_PRICE_FIELDS) + ["ticker_symbol", "ticker"])
-
-    prices: list[dict] = []
-    ticker = None
-
-    try:
-        values = _fetch_properties([neid], pids=price_pids, timeout=10.0)
-        ticker = _extract_ticker(values)
-        prices = _extract_prices(values)
-    except Exception:
-        pass
-
-    if not ticker:
-        ticker = _get_ticker_for_entity(neid)
-
-    if not prices and ticker:
-        prices = _fetch_stock_prices_mcp(ticker, entity_name)
-
-    if not prices and ticker:
-        fi_neid = _find_financial_instrument(ticker)
-        if fi_neid and fi_neid != neid:
-            try:
-                values2 = _fetch_properties([fi_neid], pids=price_pids, timeout=10.0)
-                prices = _extract_prices(values2)
-                if not ticker:
-                    ticker = _extract_ticker(values2)
-            except Exception:
-                pass
-
-    if not prices:
-        hint = " Try get_fundamentals for financial statement data." if ticker else ""
-        return f"No OHLCV price data found for '{entity_name}'.{hint}", {}
-
-    full_data: dict = {}
-    if ticker:
-        full_data["ticker"] = ticker
-    full_data["prices"] = prices
-    dates = [p["date"] for p in prices if p.get("date")]
-    closes = [p.get("close") for p in prices if p.get("close") is not None]
-    date_range = f"{min(dates)} to {max(dates)}" if dates else "unknown"
-    price_range = f"${min(closes):.2f} – ${max(closes):.2f}" if closes else "unknown"
-
-    return (
-        f"Found {len(prices)} OHLCV data point(s) for '{entity_name}'"
-        + (f" (ticker: {ticker})" if ticker else "")
-        + f". Date range: {date_range}. Close price range: {price_range}."
-    ), full_data
-
-
-def _exec_get_fundamentals(entity_name: str, neid: str) -> tuple[str, dict]:
-    """Fetch financial fundamentals (revenue, net income, EPS, etc.) from filings.
-
-    Separate from stock prices — use this for valuation and financial analysis.
-    """
-    _load_schema()
-    fundamental_pids = _resolve_pids(list(_FILING_FIELDS) + ["ticker_symbol", "ticker"])
-
-    try:
-        values = _fetch_properties([neid], pids=fundamental_pids, timeout=10.0)
-        fundamentals = _extract_fundamentals(values)
-        ticker = _extract_ticker(values)
-
-        if not fundamentals:
-            org_neid = _find_organization_with_data(entity_name)
-            if org_neid and org_neid != neid:
-                values2 = _fetch_properties([org_neid], pids=fundamental_pids, timeout=10.0)
-                fundamentals = _extract_fundamentals(values2)
-                if not ticker:
-                    ticker = _extract_ticker(values2)
-
-        if not fundamentals:
-            return f"No financial fundamentals found for '{entity_name}'.", {}
-
-        full_data: dict = {"fundamentals": fundamentals}
-        if ticker:
-            full_data["ticker"] = ticker
-
-        parts = [f"Financial fundamentals for '{entity_name}':"]
-        for k, v in list(fundamentals.items())[:8]:
-            parts.append(f"{k}={v}")
-        return " ".join(parts), full_data
-    except Exception as e:
-        return f"Error fetching fundamentals for '{entity_name}': {_error_detail(e)}", {}
 
 
 def _exec_get_filings(
@@ -945,8 +573,6 @@ _EXECUTORS = {
     "search_entities": _exec_search_entities,
     "get_properties": _exec_get_properties,
     "get_news": _exec_get_news,
-    "get_stock_prices": _exec_get_stock_prices,
-    "get_fundamentals": _exec_get_fundamentals,
     "get_filings": _exec_get_filings,
     "get_events": _exec_get_events,
     "get_relationships": _exec_get_relationships,
@@ -956,8 +582,6 @@ _REQUIRED_PARAMS: dict[str, list[str]] = {
     "search_entities": ["query"],
     "get_properties": ["entity_name", "neid"],
     "get_news": ["entity_name", "neid"],
-    "get_stock_prices": ["entity_name", "neid"],
-    "get_fundamentals": ["entity_name", "neid"],
     "get_filings": ["entity_name", "neid"],
     "get_events": ["entity_name", "neid"],
     "get_relationships": ["entity_name", "neid"],
@@ -1143,8 +767,8 @@ _research_doc: dict | None = None
 _full_results: dict = {}
 _call_counter: int = 0
 _iteration_counter: int = 0
-_max_iterations: int = 5
-DEFAULT_MAX_ITERATIONS = 5
+_max_iterations: int = 20
+DEFAULT_MAX_ITERATIONS = 20
 
 
 def research_iteration(input_json: str = "") -> str:
@@ -1170,7 +794,7 @@ def research_iteration(input_json: str = "") -> str:
         _max_iterations = query_input.pop("max_iterations", DEFAULT_MAX_ITERATIONS)
         if not isinstance(_max_iterations, int) or _max_iterations < 1:
             _max_iterations = DEFAULT_MAX_ITERATIONS
-        _max_iterations = min(_max_iterations, 20)
+        _max_iterations = min(_max_iterations, 30)
         _research_doc = {"query": query_input, "calls": []}
         _full_results = {}
         _call_counter = 0

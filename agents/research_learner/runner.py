@@ -90,7 +90,7 @@ def _call_planner(research_doc_json: str, instruction: str) -> _TimedLLMResult:
                 config=types.GenerateContentConfig(
                     system_instruction=instruction,
                     response_mime_type="application/json",
-                    temperature=0.2,
+                    temperature=0.0,
                 ),
             )
             result = json.loads(response.text)
@@ -180,7 +180,7 @@ def _resolve_instruction(instruction: str) -> str:
 def run_research(
     query: dict,
     instruction: str,
-    max_iterations: int = 5,
+    max_iterations: int = 20,
 ) -> ResearchResult:
     """Run one full research pass with instance-level state.
 
@@ -276,7 +276,7 @@ def run_batch(
     instruction: str,
     score_fn=None,
     max_workers: int = 4,
-    max_iterations: int = 5,
+    max_iterations: int = 20,
 ) -> list[BatchRunResult]:
     """Run research + optional scoring for multiple queries in parallel.
 

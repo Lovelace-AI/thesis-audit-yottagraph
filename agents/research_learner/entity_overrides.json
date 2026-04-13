@@ -1,0 +1,104 @@
+{
+    "NVIDIA": {
+        "name": "NVIDIA Corporation",
+        "neid": "01147489026568545706",
+        "type": "organization",
+        "score": 1.0000002
+    },
+    "Apple": {
+        "name": "Apple Inc.",
+        "neid": "00508379502570440213",
+        "type": "organization",
+        "score": 1
+    },
+    "Johnson & Johnson": {
+        "name": "Johnson & Johnson Incorporated",
+        "neid": "06107946766783153625",
+        "type": "organization",
+        "score": 1.0000001
+    },
+    "JPMorgan Chase": {
+        "name": "JPMorgan Chase Bank, National Association",
+        "neid": "05490061822613857001",
+        "type": "organization",
+        "score": 1
+    },
+    "Wells Fargo": {
+        "name": "Wells Fargo & Company",
+        "neid": "07076557740071364532",
+        "type": "organization",
+        "score": 1.0000002
+    },
+    "Microsoft": {
+        "name": "Microsoft Corporation",
+        "neid": "04562017146718376813",
+        "type": "organization",
+        "score": 1
+    },
+    "Alphabet": {
+        "name": "Alphabet",
+        "neid": "00146923613514606883",
+        "type": "organization",
+        "score": 0.9878247
+    },
+    "PepsiCo": {
+        "name": "PepsiCo, Inc.",
+        "neid": "09088580774477053849",
+        "type": "organization",
+        "score": 1.0000001
+    },
+    "Coca-Cola": {
+        "name": "The Coca-Cola Company",
+        "neid": "00904457966722538348",
+        "type": "organization",
+        "score": 1.0000002
+    },
+    "ExxonMobil": {
+        "name": "Exxon Mobil Corporation",
+        "neid": "05004803275035553382",
+        "type": "organization",
+        "score": 1
+    },
+    "Chevron": {
+        "name": "Chevron Corporation",
+        "neid": "06578520142381409313",
+        "type": "organization",
+        "score": 1.0000006
+    },
+    "Visa": {
+        "name": "Visa\u2019s",
+        "neid": "00062533344364874061",
+        "type": "organization",
+        "score": 1
+    },
+    "Mastercard": {
+        "name": "Mastercard International Incorporated",
+        "neid": "02923303755772848268",
+        "type": "organization",
+        "score": 0.916836
+    },
+    "American Express": {
+        "name": "American Express Travel Related Services Company, Inc.",
+        "neid": "06471664083413765389",
+        "type": "organization",
+        "score": 1.0000004
+    },
+    "Amazon": {
+        "name": "Amazon.com, Inc.",
+        "neid": "06901145116483044547",
+        "type": "organization",
+        "score": 0.99999964
+    },
+    "Walmart": {
+        "name": "Walmart Inc.",
+        "neid": "03973586183741664307",
+        "type": "organization",
+        "score": 1.0000006
+    },
+    "Target": {
+        "name": "Target Corporation",
+        "neid": "04707387056215894912",
+        "type": "organization",
+        "score": 0.99999964
+    }
+}

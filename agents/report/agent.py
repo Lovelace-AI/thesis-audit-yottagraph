@@ -19,8 +19,8 @@ document containing:
 
 - `query`: the thesis being tested, including resolved entities and claims
 - `calls`: an array of research API call results, each with:
-  - `type` (e.g. get_news, get_stock_prices, get_filings, get_events,
-    get_relationships, get_properties, get_fundamentals)
+  - `type` (e.g. get_news, get_filings, get_events,
+    get_relationships, get_properties, search_entities)
   - `params` (entity_name, neid, etc.)
   - `result` (a compact summary string)
   - `raw_data` (structured JSON with the full data returned by the call,

@@ -30,8 +30,8 @@ to make next.
 The optimizable artifact is a JSON object with exactly these keys:
 - `strategy`: high-level research planning guidance
 - `skill_filings`: how to use get_filings and get_events
-- `skill_fundamentals`: how to use get_fundamentals and get_properties for financials
-- `skill_market`: how to use get_stock_prices and related calls
+- `skill_fundamentals`: how to use get_properties for financial statement data
+- `skill_market`: how to use get_properties for OHLCV stock price data
 - `skill_news`: how to use get_news
 - `skill_discovery`: how to use search_entities, get_relationships, get_properties for discovery
 
@@ -66,6 +66,7 @@ You receive JSON with:
 - `dimension_weights`: the weight of each dimension in the total score
 - `highest_impact_dimension`: dimension with most headroom * weight
 - `plateau_detected`: true if scores haven't improved in 3+ iterations
+- `per_query_scores`: array of {query_key, score, coverage, breadth, addressability, efficiency} — numeric scores per query so you can identify which queries are dragging the average down
 - `per_query_reasoning`: array of {query_key, reasoning} from the scorer per query
 - `per_query_call_traces`: array of compact call traces per query (may be truncated)
 - `best_prompt_json`: the artifact JSON for the highest-scoring prompt (null if same as current)
@@ -93,20 +94,33 @@ Pay special attention to calls with `"status": "error"` in the call traces.
 For each error pattern you observe, consider two types of improvements:
 
 1. **Avoidance**: Can the skill teach the planner to avoid the error entirely?
-   For example, if `get_fundamentals` consistently fails on financial_instrument
-   entities, the skill might tell the planner to resolve the parent organization
-   first. If `get_stock_prices` fails on an organization, the skill might
-   suggest searching for the financial_instrument entity instead.
+   For example, if `get_properties` for financial fields consistently fails on
+   financial_instrument entities, the skill might tell the planner to resolve
+   the parent organization first. If price property fetches fail on an
+   organization, the skill might suggest searching for the financial_instrument
+   entity instead.
 
 2. **Recovery**: Can the skill teach the planner a better fallback when an error
-   occurs? For example, after a failed `get_fundamentals`, try `get_properties`
-   with specific financial fields. After a failed `get_stock_prices`, try
-   `search_entities` with `flavors: ["financial_instrument"]` for the ticker.
+   occurs? For example, after a failed `get_properties` for fundamentals, try
+   `search_entities` with `flavors: ["organization"]` to find the right entity.
+   After a failed price fetch, try `search_entities` with
+   `flavors: ["financial_instrument"]` for the ticker.
 
 Look for recurring error messages across multiple queries — these indicate
 systematic gaps in the current skill guidance rather than one-off data issues.
 Update the relevant skill with concrete instructions that would prevent or
 recover from the observed errors.
+
+### Exploration bias
+
+Track which fields have been recently modified by looking at `changed_fields` in
+`score_history`. If a field hasn't been changed in the last 5 iterations AND the
+overall score hasn't improved, consider whether that field is already optimal or
+simply neglected. Unexplored fields may contain low-hanging improvements.
+
+Also examine `per_query_scores`: if specific queries consistently score low,
+diagnose which skill is responsible for THOSE queries specifically, rather than
+defaulting to the field you've been iterating on.
 
 ### Reverting and branching
 
@@ -189,8 +203,8 @@ def _load_gcp_config() -> tuple[str, str]:
     return "broadchurch", "us-central1"
 
 
-_TRACE_RESULT_CAP = 200
-_TRACE_TOTAL_BUDGET = 8000
+_TRACE_RESULT_CAP = 500
+_TRACE_TOTAL_BUDGET = 40_000
 
 
 def _build_call_traces(
@@ -246,6 +260,7 @@ def _call_learner_llm(
     plateau_detected: bool,
     per_query_reasoning: list[dict],
     per_query_call_traces: list[dict],
+    per_query_scores: list[dict] | None = None,
     best_prompt_json: dict | None = None,
     best_prompt_id: int | None = None,
     best_prompt_avg_score: float | None = None,
@@ -271,6 +286,7 @@ def _call_learner_llm(
         "highest_impact_dimension": highest_impact,
         "plateau_detected": plateau_detected,
         "per_query_reasoning": per_query_reasoning,
+        "per_query_scores": per_query_scores or [],
         "per_query_call_traces": per_query_call_traces,
         "best_prompt_json": best_prompt_json,
         "best_prompt_id": best_prompt_id,
@@ -377,7 +393,7 @@ def run_learner(
     query_key: str | None = None,
     max_workers: int = 4,
     cooldown: float = 2.0,
-    max_research_iterations: int = 5,
+    max_research_iterations: int = 20,
 ) -> None:
     """Run the learner optimization loop.
 
@@ -564,6 +580,18 @@ def run_learner(
             per_query_reasoning = db.get_per_query_reasoning(prompt_rec.id)
             per_query_traces = _build_call_traces(db, prompt_rec.id, queries)
 
+            per_query_scores = [
+                {
+                    "query_key": r.query_key,
+                    "score": (r.score or {}).get("score", 0),
+                    "coverage": (r.score or {}).get("coverage", 0),
+                    "breadth": (r.score or {}).get("breadth", 0),
+                    "addressability": (r.score or {}).get("addressability", 0),
+                    "efficiency": (r.score or {}).get("efficiency", 0),
+                }
+                for r in results
+            ]
+
             # Load best-ever prompt for branching context
             best_prompt_json: dict | None = None
             best_prompt_id: int | None = None
@@ -593,6 +621,7 @@ def run_learner(
                     plateau_detected=plateau,
                     per_query_reasoning=per_query_reasoning,
                     per_query_call_traces=per_query_traces,
+                    per_query_scores=per_query_scores,
                     best_prompt_json=best_prompt_json,
                     best_prompt_id=best_prompt_id,
                     best_prompt_avg_score=best_prompt_avg_score,

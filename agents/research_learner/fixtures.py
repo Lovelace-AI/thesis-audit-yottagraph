@@ -106,8 +106,8 @@ QUERIES = {
                 "mentioned_as": "Alphabet",
                 "status": "resolved",
                 "name": "Alphabet",
-                "neid": "00737165042370269212",
-                "type": "financial_instrument"
+                "neid": "00146923613514606883",
+                "type": "organization"
             }
         ],
         "claims": [
@@ -198,8 +198,8 @@ QUERIES = {
                 "mentioned_as": "Alphabet",
                 "status": "resolved",
                 "name": "Alphabet",
-                "neid": "00737165042370269212",
-                "type": "financial_instrument"
+                "neid": "00146923613514606883",
+                "type": "organization"
             }
         ],
         "claims": [
@@ -218,9 +218,9 @@ QUERIES = {
             {
                 "mentioned_as": "Visa",
                 "status": "resolved",
-                "name": "Visa Inc. Class A Common Stock",
-                "neid": "02110451951707536720",
-                "type": "financial_instrument"
+                "name": "Visa\u2019s",
+                "neid": "00062533344364874061",
+                "type": "organization"
             },
             {
                 "mentioned_as": "Mastercard",

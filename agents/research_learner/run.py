@@ -146,7 +146,7 @@ def main() -> None:
     parser.add_argument("--query", help="Run against a single query key")
     parser.add_argument("--parallel", type=int, default=4, help="Thread pool size (default: 4)")
     parser.add_argument("--cooldown", type=float, default=2.0, help="Seconds between iterations (default: 2)")
-    parser.add_argument("--max-research-iterations", type=int, default=5, help="Max planner iterations per research run")
+    parser.add_argument("--max-research-iterations", type=int, default=20, help="Max planner iterations per research run")
     parser.add_argument("--history", action="store_true", help="Show score history")
     parser.add_argument("--export-best", action="store_true", help="Export best prompt to researcher/planner_prompt.json")
     parser.add_argument("--report", action="store_true", help="Generate HTML report")
