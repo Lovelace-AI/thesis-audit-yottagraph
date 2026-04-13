@@ -59,13 +59,18 @@ Each dimension is scored 0-25, then weighted:
 
 You receive JSON with:
 - `current_prompt_json`: the current artifact (strategy + 5 skills)
-- `score_history`: recent iterations with scores and change descriptions
+- `score_history`: recent iterations with scores, change descriptions, and `parent_prompt_id`
+  showing how prompts are linked (parent_prompt_id differs from the previous entry's
+  prompt_id when a branch occurred)
 - `sub_scores`: per-dimension average scores for the current artifact
 - `dimension_weights`: the weight of each dimension in the total score
 - `highest_impact_dimension`: dimension with most headroom * weight
 - `plateau_detected`: true if scores haven't improved in 3+ iterations
 - `per_query_reasoning`: array of {query_key, reasoning} from the scorer per query
 - `per_query_call_traces`: array of compact call traces per query (may be truncated)
+- `best_prompt_json`: the artifact JSON for the highest-scoring prompt (null if same as current)
+- `best_prompt_id`: the prompt id of the best-scoring prompt (null if same as current)
+- `best_prompt_avg_score`: average score of the best-scoring prompt (null if same as current)
 
 ## Diagnosis rules
 
@@ -103,6 +108,31 @@ systematic gaps in the current skill guidance rather than one-off data issues.
 Update the relevant skill with concrete instructions that would prevent or
 recover from the observed errors.
 
+### Reverting and branching
+
+You are not limited to iterating on the latest prompt. You can base your changes
+on ANY prompt from `score_history` by setting `base_prompt_id` in your output.
+
+Consider branching when:
+- The latest iteration's score dropped significantly (e.g., 5+ points) compared
+  to the best-ever score. The regression may mean the last change was harmful,
+  and iterating on top of it may compound the problem.
+- A plateau has persisted across several iterations on the current branch.
+  Going back to an earlier high-scoring prompt and trying a different optimization
+  direction may break through.
+
+When you decide to branch:
+- Set `base_prompt_id` to the `prompt_id` of the prompt you want to branch from
+  (visible in `score_history`).
+- If `best_prompt_json` is provided (non-null), you can use it directly as your
+  starting point — modify it and return the result as `prompt_json`.
+- Your `change_description` should note the revert, e.g., "Reverted to prompt 3
+  and tried a different approach to skill_market."
+
+This is a soft heuristic, not a hard rule. Use your judgment — sometimes a score
+drop is temporary and the next forward iteration will recover. But if the drop is
+large or the direction seems clearly wrong, branching is the better choice.
+
 ## Rules
 
 1. Usually modify 1-2 fields per iteration. Use `changed_fields` to declare which.
@@ -125,8 +155,12 @@ Return ONLY a JSON object (no markdown, no explanation):
         "skill_discovery": "..."
     },
     "changed_fields": ["skill_market"],
-    "change_description": "<1-2 sentences: what you changed and why>"
+    "change_description": "<1-2 sentences: what you changed and why>",
+    "base_prompt_id": null
 }
+
+`base_prompt_id`: set to null (or omit) to iterate on the current prompt as usual.
+Set to an earlier prompt_id from score_history to branch from that prompt instead.
 """
 
 MAX_RETRIES = 3
@@ -218,6 +252,9 @@ def _call_learner_llm(
     plateau_detected: bool,
     per_query_reasoning: list[dict],
     per_query_call_traces: list[dict],
+    best_prompt_json: dict | None = None,
+    best_prompt_id: int | None = None,
+    best_prompt_avg_score: float | None = None,
 ) -> dict:
     """Ask the learner LLM to generate an improved prompt artifact."""
     from google import genai
@@ -241,14 +278,18 @@ def _call_learner_llm(
         "plateau_detected": plateau_detected,
         "per_query_reasoning": per_query_reasoning,
         "per_query_call_traces": per_query_call_traces,
+        "best_prompt_json": best_prompt_json,
+        "best_prompt_id": best_prompt_id,
+        "best_prompt_avg_score": best_prompt_avg_score,
     })
 
     LEARNER_MODEL = "gemini-2.5-flash"
+    best_info = f", best_prompt={best_prompt_id} avg={best_prompt_avg_score:.1f}" if best_prompt_id else ""
     log.info(
         f"Learner LLM call starting (model={LEARNER_MODEL}, highest_impact={highest_impact}, "
         f"plateau={plateau_detected}, history={len(score_history)} entries, "
         f"artifact {len(json.dumps(current_prompt_json)):,} chars, "
-        f"traces={len(per_query_call_traces)})"
+        f"traces={len(per_query_call_traces)}{best_info})"
     )
 
     t_client = time.monotonic()
@@ -275,8 +316,10 @@ def _call_learner_llm(
             change = result.get("change_description", "")
             changed = result.get("changed_fields", [])
             new_json = result.get("prompt_json", {})
+            base_id = result.get("base_prompt_id")
+            branch_info = f", base_prompt_id={base_id}" if base_id else ""
             log.info(
-                f"Learner LLM returned: changed_fields={changed} "
+                f"Learner LLM returned: changed_fields={changed}{branch_info} "
                 f"(model={LEARNER_MODEL}, client={client_init_s:.2f}s gen={generate_s:.1f}s)"
             )
             if change:
@@ -527,6 +570,25 @@ def run_learner(
             per_query_reasoning = db.get_per_query_reasoning(prompt_rec.id)
             per_query_traces = _build_call_traces(db, prompt_rec.id, queries)
 
+            # Load best-ever prompt for branching context
+            best_prompt_json: dict | None = None
+            best_prompt_id: int | None = None
+            best_prompt_avg_score: float | None = None
+            best_prompt_rec = db.get_best_prompt()
+            if best_prompt_rec and best_prompt_rec.id != prompt_rec.id:
+                try:
+                    best_artifact = json.loads(best_prompt_rec.prompt_text)
+                    if validate_artifact(best_artifact):
+                        best_prompt_json = best_artifact
+                        best_prompt_id = best_prompt_rec.id
+                        best_prompt_avg_score = db.get_avg_score_for_prompt(best_prompt_rec.id)
+                        log.info(
+                            f"Best prompt available for branching: id={best_prompt_id} "
+                            f"avg={best_prompt_avg_score:.1f}"
+                        )
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
             t_learner = time.monotonic()
             learner_llm_s = 0.0
             try:
@@ -537,23 +599,51 @@ def run_learner(
                     plateau_detected=plateau,
                     per_query_reasoning=per_query_reasoning,
                     per_query_call_traces=per_query_traces,
+                    best_prompt_json=best_prompt_json,
+                    best_prompt_id=best_prompt_id,
+                    best_prompt_avg_score=best_prompt_avg_score,
                 )
                 learner_llm_s = time.monotonic() - t_learner
                 new_artifact = learner_result.get("prompt_json", {})
                 change_desc = learner_result.get("change_description", "")
                 changed_fields = learner_result.get("changed_fields", [])
+                base_prompt_id_req = learner_result.get("base_prompt_id")
+
+                # Determine parent for the new prompt (branching support)
+                parent_id = prompt_rec.id
+                parent_gen = prompt_rec.generation
+                compare_artifact = current_artifact
+                if base_prompt_id_req and base_prompt_id_req != prompt_rec.id:
+                    base_rec = db.get_prompt(base_prompt_id_req)
+                    if base_rec:
+                        parent_id = base_rec.id
+                        parent_gen = base_rec.generation
+                        try:
+                            compare_artifact = json.loads(base_rec.prompt_text)
+                        except (json.JSONDecodeError, TypeError):
+                            compare_artifact = current_artifact
+                        log.info(
+                            f"BRANCH: learner chose to branch from prompt {base_rec.id} "
+                            f"(gen {base_rec.generation}) instead of latest {prompt_rec.id}"
+                        )
+                    else:
+                        log.warning(
+                            f"Learner requested base_prompt_id={base_prompt_id_req} "
+                            f"but it doesn't exist, falling back to latest"
+                        )
 
                 validated = validate_artifact(new_artifact)
-                if validated and json.dumps(validated, sort_keys=True) != json.dumps(current_artifact, sort_keys=True):
+                if validated and json.dumps(validated, sort_keys=True) != json.dumps(compare_artifact, sort_keys=True):
                     db.insert_prompt(
                         prompt_text=json.dumps(validated),
-                        parent_id=prompt_rec.id,
-                        generation=prompt_rec.generation + 1,
+                        parent_id=parent_id,
+                        generation=parent_gen + 1,
                         change_description=change_desc,
                     )
+                    branch_note = f" (branched from {parent_id})" if parent_id != prompt_rec.id else ""
                     log.info(
-                        f"New artifact inserted (gen {prompt_rec.generation + 1}, "
-                        f"changed={changed_fields}): {change_desc}"
+                        f"New artifact inserted (gen {parent_gen + 1}, "
+                        f"changed={changed_fields}{branch_note}): {change_desc}"
                     )
                 elif not validated:
                     log.warning("Learner returned invalid artifact, will retry next iteration")

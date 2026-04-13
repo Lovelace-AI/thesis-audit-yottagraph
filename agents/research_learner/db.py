@@ -334,7 +334,8 @@ class LearnerDB:
         """Return recent learner iterations with prompt change descriptions for the learner LLM."""
         rows = self.conn.execute(
             """SELECT li.iteration_number, li.avg_score, li.min_score, li.max_score,
-                      p.id as prompt_id, p.generation, p.change_description
+                      p.id as prompt_id, p.generation, p.change_description,
+                      p.parent_id as parent_prompt_id
                FROM learner_iterations li
                JOIN prompts p ON p.id = li.prompt_id
                ORDER BY li.iteration_number DESC
@@ -350,6 +351,7 @@ class LearnerDB:
                 "prompt_id": r["prompt_id"],
                 "generation": r["generation"],
                 "change_description": r["change_description"],
+                "parent_prompt_id": r["parent_prompt_id"],
             }
             for r in reversed(rows)
         ]
@@ -411,3 +413,31 @@ class LearnerDB:
             )
             for r in rows
         ]
+
+    def get_prompt_tree_for_report(self) -> list[dict]:
+        """Return iteration data with parent linkage for the evolution tree chart."""
+        rows = self.conn.execute(
+            """SELECT li.iteration_number, li.avg_score, li.prompt_id,
+                      p.parent_id as parent_prompt_id, p.change_description
+               FROM learner_iterations li
+               JOIN prompts p ON p.id = li.prompt_id
+               ORDER BY li.iteration_number"""
+        ).fetchall()
+        pid_to_iter: dict[int, int] = {}
+        pid_to_score: dict[int, float] = {}
+        result = []
+        for r in rows:
+            pid_to_iter[r["prompt_id"]] = r["iteration_number"]
+            pid_to_score[r["prompt_id"]] = r["avg_score"]
+            parent_iter = pid_to_iter.get(r["parent_prompt_id"])
+            parent_score = pid_to_score.get(r["parent_prompt_id"])
+            result.append({
+                "iteration": r["iteration_number"],
+                "avg_score": r["avg_score"],
+                "prompt_id": r["prompt_id"],
+                "parent_prompt_id": r["parent_prompt_id"],
+                "parent_iteration": parent_iter,
+                "parent_score": parent_score,
+                "change_description": r["change_description"] or "",
+            })
+        return result

@@ -36,6 +36,7 @@ HTML_TEMPLATE = """\
   .lineage-step .score { color: #888; font-size: 0.8rem; margin-left: 12px; }
   .lineage-step .desc { margin-top: 4px; font-size: 0.85rem; }
   .muted { color: #666; }
+  .branch-tag { display: inline-block; background: #ff5c00; color: #000; font-size: 0.65rem; font-weight: 700; padding: 1px 5px; border-radius: 3px; margin-left: 6px; vertical-align: middle; }
 </style>
 </head>
 <body>
@@ -76,10 +77,15 @@ HTML_TEMPLATE = """\
   <canvas id="subScoreChart"></canvas>
 </div>
 
+<h2>Prompt Evolution</h2>
+<div class="chart-container">
+  <canvas id="evolutionChart"></canvas>
+</div>
+
 <h2>Score History</h2>
 <table>
   <thead>
-    <tr><th>Iter</th><th>Prompt</th><th>Avg</th><th>Min</th><th>Max</th><th>Timestamp</th></tr>
+    <tr><th>Iter</th><th>Prompt</th><th>Parent</th><th>Avg</th><th>Min</th><th>Max</th><th>Timestamp</th></tr>
   </thead>
   <tbody>
     HISTORY_ROWS
@@ -187,6 +193,110 @@ new Chart(subCtx, {
     plugins: { legend: { labels: { color: '#ccc', font: { size: 11 } } } },
   },
 });
+
+// Prompt evolution tree chart
+const evoCtx = document.getElementById('evolutionChart').getContext('2d');
+const evoData = DATA.evolution || [];
+
+if (evoData.length > 0) {
+  const branchColors = ['#3fea00', '#003bff', '#ff5c00', '#a855f7', '#06b6d4', '#ef4444', '#eab308', '#ec4899'];
+  const nodeBranch = {};
+  let branchIdx = 0;
+
+  evoData.forEach((node, i) => {
+    const isBranch = node.parent_iteration !== null && i > 0 && node.parent_iteration !== evoData[i - 1].iteration;
+    if (i === 0) {
+      nodeBranch[node.iteration] = 0;
+    } else if (isBranch) {
+      branchIdx++;
+      nodeBranch[node.iteration] = branchIdx;
+    } else if (node.parent_iteration !== null && nodeBranch[node.parent_iteration] !== undefined) {
+      nodeBranch[node.iteration] = nodeBranch[node.parent_iteration];
+    } else {
+      nodeBranch[node.iteration] = 0;
+    }
+  });
+
+  const branches = {};
+  evoData.forEach(node => {
+    const b = nodeBranch[node.iteration] || 0;
+    if (!branches[b]) branches[b] = [];
+    branches[b].push(node);
+  });
+
+  const evoDatasets = [];
+
+  Object.keys(branches).forEach(b => {
+    const color = branchColors[b % branchColors.length];
+    const nodes = branches[b];
+    evoDatasets.push({
+      label: b === '0' ? 'Main' : 'Branch ' + b,
+      data: nodes.map(n => ({ x: n.iteration, y: n.avg_score })),
+      borderColor: color,
+      backgroundColor: color,
+      pointRadius: 5,
+      pointHoverRadius: 7,
+      showLine: false,
+    });
+  });
+
+  const treeLinePlugin = {
+    id: 'treeLines',
+    beforeDatasetsDraw(chart) {
+      const { ctx } = chart;
+      const xScale = chart.scales.x;
+      const yScale = chart.scales.y;
+      ctx.save();
+      ctx.lineWidth = 2;
+
+      evoData.forEach(node => {
+        if (node.parent_iteration === null || node.parent_score === null) return;
+        const b = nodeBranch[node.iteration] || 0;
+        ctx.strokeStyle = branchColors[b % branchColors.length];
+        ctx.beginPath();
+        ctx.moveTo(xScale.getPixelForValue(node.parent_iteration), yScale.getPixelForValue(node.parent_score));
+        ctx.lineTo(xScale.getPixelForValue(node.iteration), yScale.getPixelForValue(node.avg_score));
+        ctx.stroke();
+      });
+
+      ctx.restore();
+    }
+  };
+
+  new Chart(evoCtx, {
+    type: 'scatter',
+    data: { datasets: evoDatasets },
+    options: {
+      responsive: true,
+      scales: {
+        x: { type: 'linear', title: { display: true, text: 'Iteration', color: '#888' }, ticks: { color: '#888', stepSize: 1 }, grid: { color: '#222' } },
+        y: { min: 0, max: 100, title: { display: true, text: 'Avg Score', color: '#888' }, ticks: { color: '#888' }, grid: { color: '#222' } },
+      },
+      plugins: {
+        legend: { labels: { color: '#ccc', font: { size: 11 } } },
+        tooltip: {
+          callbacks: {
+            label: function(context) {
+              const iter = context.parsed.x;
+              const node = evoData.find(n => n.iteration === iter);
+              if (!node) return context.dataset.label + ': ' + context.parsed.y;
+              let label = 'Iter ' + iter + '  score=' + (node.avg_score !== null ? node.avg_score.toFixed(1) : '?') + '  prompt=' + node.prompt_id;
+              if (node.parent_prompt_id !== null) label += '  parent=' + node.parent_prompt_id;
+              return label;
+            },
+            afterLabel: function(context) {
+              const iter = context.parsed.x;
+              const node = evoData.find(n => n.iteration === iter);
+              if (node && node.change_description) return node.change_description;
+              return '';
+            }
+          }
+        }
+      },
+    },
+    plugins: [treeLinePlugin],
+  });
+}
 </script>
 </body>
 </html>
@@ -241,10 +351,13 @@ def generate_report(db: LearnerDB, output_path: Path | None = None) -> Path:
         for r in runs
     ]
 
+    evolution_data = db.get_prompt_tree_for_report()
+
     data_json = json.dumps({
         "iterations": iter_data,
         "runs": run_data,
         "sub_scores": sub_score_data,
+        "evolution": evolution_data,
     })
 
     # Summary values
@@ -254,17 +367,36 @@ def generate_report(db: LearnerDB, output_path: Path | None = None) -> Path:
         best_avg = db.get_avg_score_for_prompt(best.id) or 0.0
         best_id = f"#{best.id} (gen {best.generation})"
 
-    # History rows
+    # Build prompt_id -> parent_id map for history rows
+    prompt_parent_map = {p.id: p.parent_id for p in prompts}
+
+    # Build iteration -> prompt_id map for branch detection
+    iter_prompt_ids = [(it.iteration_number, it.prompt_id) for it in iterations]
+
     history_rows = ""
-    for it in iterations:
+    for idx, it in enumerate(iterations):
         avg = f"{it.avg_score:.1f}" if it.avg_score is not None else "-"
         mn = f"{it.min_score:.1f}" if it.min_score is not None else "-"
         mx = f"{it.max_score:.1f}" if it.max_score is not None else "-"
         ts = it.created_at[:19] if it.created_at else ""
-        history_rows += f"    <tr><td>{it.iteration_number}</td><td>{it.prompt_id}</td><td>{avg}</td><td>{mn}</td><td>{mx}</td><td>{ts}</td></tr>\n"
+        parent_id = prompt_parent_map.get(it.prompt_id)
+        parent_str = str(parent_id) if parent_id is not None else "-"
+
+        is_branch = False
+        if idx > 0 and parent_id is not None:
+            prev_prompt_id = iter_prompt_ids[idx - 1][1]
+            if parent_id != prev_prompt_id:
+                is_branch = True
+
+        branch_tag = '<span class="branch-tag">BRANCH</span>' if is_branch else ""
+        history_rows += (
+            f"    <tr><td>{it.iteration_number}</td><td>{it.prompt_id}</td>"
+            f"<td>{parent_str}{branch_tag}</td>"
+            f"<td>{avg}</td><td>{mn}</td><td>{mx}</td><td>{ts}</td></tr>\n"
+        )
 
     if not history_rows:
-        history_rows = '    <tr><td colspan="6" class="muted">No iterations recorded yet.</td></tr>'
+        history_rows = '    <tr><td colspan="7" class="muted">No iterations recorded yet.</td></tr>'
 
     # Lineage HTML
     lineage_html = ""
