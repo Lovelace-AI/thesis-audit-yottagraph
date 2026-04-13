@@ -714,9 +714,17 @@ export function useThesisResearch() {
             // Stage 3: Report
             status.value = 'reporting';
 
+            const enrichedCalls = calls.map((c: any) => {
+                const rawData = showYourWork[c.id];
+                if (rawData && Object.keys(rawData).length > 0) {
+                    return { ...c, raw_data: rawData };
+                }
+                return c;
+            });
+
             const reportInput = {
                 query: qr,
-                calls,
+                calls: enrichedCalls,
             };
 
             const { text: reportText } = await sendToAgent('report', JSON.stringify(reportInput));

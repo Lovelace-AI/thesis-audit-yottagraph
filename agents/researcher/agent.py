@@ -44,7 +44,7 @@ _EVENT_FIELDS = (
     "category", "form_8k_event", "form_8k_item_code", "event_status",
     "likelihood", "description", "date",
 )
-_NEWS_FIELDS = ("title", "sentiment", "original_publication_name", "tone", "title_factuality")
+_NEWS_FIELDS = ("title", "original_publication_name", "tone")
 
 _TICKER_PIDS: set[int] = set()
 _PRICE_PIDS: set[int] = set()
@@ -319,7 +319,6 @@ def _extract_fundamentals(values: list[dict]) -> dict:
 def _extract_news(values: list[dict]) -> list[dict]:
     _load_schema()
     title_pid = _name_to_pid.get("title")
-    sentiment_pid = _name_to_pid.get("sentiment")
     pub_name_pid = _name_to_pid.get("original_publication_name")
     tone_pid = _name_to_pid.get("tone")
 
@@ -332,11 +331,6 @@ def _extract_news(values: list[dict]) -> list[dict]:
         val = v.get("value")
         if pid == title_pid and val:
             by_entity[eid]["title"] = val
-        elif pid == sentiment_pid and val is not None:
-            try:
-                by_entity[eid]["sentiment"] = float(val)
-            except (ValueError, TypeError):
-                pass
         elif pid == pub_name_pid and val:
             by_entity[eid]["source"] = val
         elif pid == tone_pid and val:
@@ -354,7 +348,6 @@ def _extract_news(values: list[dict]) -> list[dict]:
                 "neid": info.get("neid", eid),
                 "title": info["title"],
                 "date": (info.get("date") or "")[:10],
-                "sentiment": info.get("sentiment"),
                 "source": info.get("source"),
                 "tone": info.get("tone"),
             })
@@ -612,16 +605,13 @@ def _exec_get_news(entity_name: str, neid: str, limit: int = 15) -> tuple[str, d
             return f"No news articles found for '{entity_name}'.", {}
 
         articles = articles[:limit]
-        sentiments = [a["sentiment"] for a in articles if a.get("sentiment") is not None]
         dates = [a["date"] for a in articles if a.get("date")]
-        avg_sent = round(sum(sentiments) / len(sentiments), 2) if sentiments else None
         date_range = f"{min(dates)} to {max(dates)}" if dates else "unknown"
 
-        parts = [f"Found {len(articles)} news article(s) for '{entity_name}'."]
-        parts.append(f"Date range: {date_range}.")
-        if avg_sent is not None:
-            parts.append(f"Average sentiment: {avg_sent} ({len(sentiments)} scored).")
-        return " ".join(parts), {"articles": articles}
+        return (
+            f"Found {len(articles)} news article(s) for '{entity_name}'. "
+            f"Date range: {date_range}."
+        ), {"articles": articles}
     except Exception as e:
         return f"Error fetching news for '{entity_name}': {e}", {}
 
@@ -1064,124 +1054,18 @@ def _abridge_research_doc(doc: dict, max_total: int = _MAX_DOC_SIZE) -> str:
 # Planner LLM — calls Gemini directly for structured planning
 # ---------------------------------------------------------------------------
 
-PLANNER_INSTRUCTION = """\
-You are the planning component of a financial research system. You operate in a loop:
-
-1. You receive a JSON document containing a `query` (thesis, entities, claims, data_needs)
-   and a list of `calls` already made with their results.
-2. You decide what API calls to make next, OR declare research complete.
-
-## Response format
-
-Return a JSON object with one of these two structures:
-
-### Request more data:
-{
-    "action": "research",
-    "reasoning": "Brief explanation of what you need and why",
-    "calls": [
-        {"type": "get_news", "params": {"entity_name": "Netflix", "neid": "...", "limit": 10}},
-        {"type": "get_stock_prices", "params": {"entity_name": "Disney", "neid": "..."}},
-        {"type": "get_properties", "params": {"entity_name": "Apple", "neid": "...", "properties": ["ticker_symbol", "industry", "sector"]}}
-    ]
-}
-
-### Research complete:
-{
-    "action": "done",
-    "reasoning": "Brief explanation of why you have enough data"
-}
-
-## Available API calls
-
-All calls accept optional parameters to control scope and cost. Use them.
-
-### search_entities(query, flavors?, max_results?)
-Search for entities by name. Returns matching NEIDs, names, flavors, and match scores.
-Use to discover entities not in the original query — e.g. find a company's
-financial_instrument entity to get stock data, or find competitors.
-- **query** (required): search term (company name, ticker, etc.)
-- **flavors** (optional list): filter by entity type, e.g. ["organization", "financial_instrument"]
-- **max_results** (optional int, default 5): cap on results
-
-### get_properties(entity_name, neid, properties?, limit?)
-Fetch specific named properties for an entity. Much cheaper than a full property dump.
-- **entity_name** (required): human-readable name
-- **neid** (required): entity NEID
-- **properties** (optional list): property names to fetch, e.g. ["ticker_symbol", "industry",
-  "sector", "company_cik"]. Omit to fetch all (expensive — avoid when possible).
-- **limit** (optional int, default 10): max values per property (for time-series properties)
-
-Common property names: ticker_symbol, ticker, company_cik, industry, sector, market_cap,
-exchange, country, description, website, employees, founded_date.
-
-### get_news(entity_name, neid, limit?)
-Fetches news articles linked to the entity. Returns article count, date range,
-average sentiment score (-1 to 1), and per-article data (title, date, sentiment, source, tone).
-- **limit** (optional int, default 15): max articles to return. Use 5-10 for quick context,
-  15-20 for deep analysis.
-
-### get_stock_prices(entity_name, neid)
-Fetches OHLCV stock price history. Returns daily data (open/high/low/close/volume) with
-date range and ticker symbol. If prices aren't available, suggests using get_fundamentals.
-Use for price trends, volatility, or correlation analysis.
-
-### get_fundamentals(entity_name, neid)
-Fetches financial statement data: total_revenue, net_income, total_assets,
-total_liabilities, shareholders_equity, shares_outstanding, eps_basic, eps_diluted.
-Separate from stock prices. Use for valuation, financial health, or earnings analysis.
-If the entity is a financial_instrument, use search_entities to find the parent organization
-first, then call get_fundamentals on the organization NEID.
-
-### get_filings(entity_name, neid, form_types?, limit?)
-Fetches SEC filings linked to the entity.
-- **form_types** (optional list): filter by form type, e.g. ["10-K", "10-Q"] or ["Form 4"].
-  Omit to fetch all types.
-- **limit** (optional int, default 20): max filings to return.
-Returns form type, filing date, accession number, description. For Form 4 insider trades,
-also returns transaction_type and shares_transacted.
-
-### get_events(entity_name, neid, limit?)
-Fetches corporate events: mergers, product launches, lawsuits, leadership changes,
-regulatory actions, analyst reports. Returns category, description, date, likelihood.
-- **limit** (optional int, default 20): max events.
-
-### get_relationships(entity_name, neid, direction?, limit?)
-Discovers entities linked to the given entity.
-- **direction** (optional, default "both"): "incoming", "outgoing", or "both".
-  "incoming" finds entities that link TO this one (filings, events, articles about it).
-  "outgoing" finds entities this one links TO (subsidiaries, investors).
-- **limit** (optional int, default 20): max related entities to return.
-
-## Strategy
-
-- **Be precise about what you fetch**: Use the `properties` parameter on get_properties
-  and `form_types`/`limit` on other calls to avoid overfetching. Every parameter you
-  specify reduces cost and latency.
-- **Start broad**: First iteration should cover all entities with their primary data needs.
-  Match data_needs categories to call types: "market_data" → get_stock_prices,
-  "fundamentals" → get_fundamentals, "sentiment" → get_news, "filings" → get_filings,
-  "events" → get_events.
-- **Use `data_needs`**: The query rewrite identified relevant categories. Cover all of them.
-- **Batch calls**: Request multiple calls per iteration. Don't request one at a time.
-- **Use search_entities for discovery**: If you need an entity not in query.entities
-  (e.g. a financial_instrument for stock prices, or a competitor), use search_entities
-  first. Then use the returned NEID in subsequent calls.
-- **Follow up on thin results**: If a call returns 0 results, try get_properties with
-  a few diagnostic properties (["ticker_symbol", "company_cik", "industry"]) to understand
-  what data exists. Or use get_relationships to find related entities.
-- **NEIDs are mandatory for entity calls**: get_properties, get_news, get_stock_prices,
-  get_fundamentals, get_filings, get_events, get_relationships all require entity_name
-  and neid. Use NEIDs from query.entities or from search_entities results.
-  Never fabricate a NEID.
-- **Don't over-fetch**: 3-4 iterations is typical. Use limits and filters.
-- **Error handling**: If a call errors, note it and move on. Never retry the exact same
-  call — it will fail the same way. If multiple calls fail for an entity, that entity's
-  data is unavailable.
-- **Know when to stop**: Say "done" when you have sufficient evidence to address every
-  claim in the thesis, or after exhausting useful avenues. The report agent can work
-  with partial data.
-"""
+try:
+    from researcher.planner_prompt import (
+        DEFAULT_OPTIMIZABLE_PROMPT,
+        assemble_planner_instruction,
+        load_artifact,
+    )
+except ImportError:
+    from .planner_prompt import (
+        DEFAULT_OPTIMIZABLE_PROMPT,
+        assemble_planner_instruction,
+        load_artifact,
+    )
 
 
 def _load_broadchurch_config() -> dict:
@@ -1204,17 +1088,18 @@ _planner_instruction_cache: str | None = None
 
 
 def _load_planner_instruction() -> str:
-    """Load planner instruction from file if present, else use hardcoded default."""
+    """Load planner instruction, preferring planner_prompt.json if present."""
     global _planner_instruction_cache
     if _planner_instruction_cache is not None:
         return _planner_instruction_cache
     from pathlib import Path
 
-    prompt_file = Path(__file__).parent / "planner_prompt.txt"
-    if prompt_file.exists():
-        _planner_instruction_cache = prompt_file.read_text().strip()
+    json_file = Path(__file__).parent / "planner_prompt.json"
+    if json_file.exists():
+        artifact = load_artifact(json_file)
     else:
-        _planner_instruction_cache = PLANNER_INSTRUCTION
+        artifact = DEFAULT_OPTIMIZABLE_PROMPT
+    _planner_instruction_cache = assemble_planner_instruction(artifact)
     return _planner_instruction_cache
 
 

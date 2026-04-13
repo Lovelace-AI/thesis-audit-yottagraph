@@ -72,6 +72,8 @@ def cmd_history(args: argparse.Namespace) -> None:
 
 
 def cmd_export_best(args: argparse.Namespace) -> None:
+    import json
+
     from research_learner.db import LearnerDB
 
     db_path = Path(args.db) if args.db else None
@@ -84,23 +86,33 @@ def cmd_export_best(args: argparse.Namespace) -> None:
         return
 
     best_avg = db.get_avg_score_for_prompt(best.id)
-    out_path = Path(__file__).resolve().parent.parent / "researcher" / "planner_prompt.txt"
-    out_path.write_text(best.prompt_text)
+    out_path = Path(__file__).resolve().parent.parent / "researcher" / "planner_prompt.json"
 
-    print(f"Exported prompt id={best.id} (gen {best.generation}, avg score={best_avg:.1f})")
-    print(f"Written to: {out_path}")
-    print(f"\nPrompt ({len(best.prompt_text)} chars):")
-    print("-" * 60)
-    # Show first/last few lines
-    lines = best.prompt_text.split("\n")
-    if len(lines) <= 20:
-        print(best.prompt_text)
+    try:
+        artifact = json.loads(best.prompt_text)
+    except (json.JSONDecodeError, TypeError):
+        artifact = None
+
+    from researcher.planner_prompt import validate_artifact
+
+    if validate_artifact(artifact):
+        out_path.write_text(json.dumps(artifact, indent=2) + "\n")
+        print(f"Exported JSON artifact id={best.id} (gen {best.generation}, avg score={best_avg:.1f})")
     else:
-        for line in lines[:10]:
-            print(line)
-        print(f"  ... ({len(lines) - 20} lines omitted) ...")
-        for line in lines[-10:]:
-            print(line)
+        out_path.write_text(best.prompt_text)
+        print(
+            f"WARNING: Best prompt is not a valid JSON artifact (pre-refactor prompt?).\n"
+            f"Exported raw text id={best.id} (gen {best.generation}, avg score={best_avg:.1f})"
+        )
+
+    print(f"Written to: {out_path}")
+
+    keys = list(artifact.keys()) if isinstance(artifact, dict) else []
+    if keys:
+        print(f"\nArtifact keys: {', '.join(keys)}")
+        for k in keys:
+            val = str(artifact[k])
+            print(f"  {k}: {len(val)} chars")
 
     db.close()
 
@@ -136,7 +148,7 @@ def main() -> None:
     parser.add_argument("--cooldown", type=float, default=2.0, help="Seconds between iterations (default: 2)")
     parser.add_argument("--max-research-iterations", type=int, default=5, help="Max planner iterations per research run")
     parser.add_argument("--history", action="store_true", help="Show score history")
-    parser.add_argument("--export-best", action="store_true", help="Export best prompt to researcher/planner_prompt.txt")
+    parser.add_argument("--export-best", action="store_true", help="Export best prompt to researcher/planner_prompt.json")
     parser.add_argument("--report", action="store_true", help="Generate HTML report")
 
     args = parser.parse_args()

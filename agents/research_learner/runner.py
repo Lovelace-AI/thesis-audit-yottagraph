@@ -15,6 +15,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from researcher.agent import _abridge_research_doc, _dispatch_call, _load_schema
+from researcher.planner_prompt import (
+    DEFAULT_OPTIMIZABLE_PROMPT,
+    assemble_planner_instruction,
+    validate_artifact,
+)
 
 from research_learner.log import get_logger
 
@@ -155,6 +160,23 @@ def _dispatch_with_retry(call_spec: dict) -> tuple[str, dict]:
     return f"Error after {MAX_RETRIES} retries: {last_error}", {}
 
 
+def _resolve_instruction(instruction: str) -> str:
+    """Resolve a planner instruction string.
+
+    If the string is valid JSON matching the artifact schema, assemble the full
+    instruction from PREAMBLE + rendered artifact. Otherwise treat it as a raw
+    instruction string (backwards-compatible with pre-JSON prompts).
+    """
+    try:
+        parsed = json.loads(instruction)
+        validated = validate_artifact(parsed)
+        if validated is not None:
+            return assemble_planner_instruction(validated)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return instruction
+
+
 def run_research(
     query: dict,
     instruction: str,
@@ -164,12 +186,13 @@ def run_research(
 
     Args:
         query: QueryRewrite JSON dict (thesis, entities, claims, data_needs).
-        instruction: The planner system instruction to use.
+        instruction: The planner system instruction (raw text or JSON artifact).
         max_iterations: Max planner iterations before forcing done.
 
     Returns:
         ResearchResult with the research doc, stats, and full data.
     """
+    resolved_instruction = _resolve_instruction(instruction)
     thesis = query.get("thesis", "?")[:80]
     log.info(f"Research starting: thesis={thesis!r} max_iter={max_iterations}")
     t0 = time.monotonic()
@@ -192,7 +215,7 @@ def run_research(
         prompt = _abridge_research_doc(research_doc)
 
         try:
-            timed = _call_planner(prompt, instruction)
+            timed = _call_planner(prompt, resolved_instruction)
             plan = timed.result
             planner_client_s += timed.client_init_s
             planner_gen_s += timed.generate_s

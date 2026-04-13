@@ -20,16 +20,31 @@ from research_learner.scorer import DIMENSION_WEIGHTS, ScoreResult, score_resear
 log = get_logger("learner")
 
 LEARNER_INSTRUCTION = """\
-You are a prompt engineer optimizing a system instruction for a financial research
-planner agent. The planner receives a thesis query (entities, claims, data needs)
-and a growing research document, then decides which API calls to make next.
+You are a prompt engineer optimizing a structured JSON instruction artifact for a
+financial research planner agent. The planner receives a thesis query (entities,
+claims, data needs) and a growing research document, then decides which API calls
+to make next.
+
+## Artifact structure
+
+The optimizable artifact is a JSON object with exactly these keys:
+- `strategy`: high-level research planning guidance
+- `skill_filings`: how to use get_filings and get_events
+- `skill_fundamentals`: how to use get_fundamentals and get_properties for financials
+- `skill_market`: how to use get_stock_prices and related calls
+- `skill_news`: how to use get_news
+- `skill_discovery`: how to use search_entities, get_relationships, get_properties for discovery
+
+There is a fixed PREAMBLE (role, response format, call signatures) that you CANNOT
+see or modify. You only modify the strategy and skill fields above.
 
 ## Your task
 
-Given the current planner instruction and its recent performance scores, produce
-an improved version. The goal is to maximize the weighted total score (0-100).
+Given the current artifact JSON and diagnostic information (scores, per-query
+scorer reasoning, compact call traces), produce an improved artifact. The goal is
+to maximize the weighted total score (0-100).
 
-Each dimension is scored 0-25, then weighted to compute the total:
+Each dimension is scored 0-25, then weighted:
 
 | Dimension        | Weight | Max contribution |
 |------------------|--------|------------------|
@@ -38,39 +53,57 @@ Each dimension is scored 0-25, then weighted to compute the total:
 | Addressability   | 0.50   | 50 points        |
 | Efficiency       | 0.10   | 10 points        |
 
-**Addressability is by far the most important dimension.** The research must
-gather data that directly helps evaluate each claim in the thesis. Coverage and
-breadth support this, but are secondary. Efficiency is a tiebreaker.
+**Addressability is by far the most important dimension.**
 
 ## Input
 
 You receive JSON with:
-- `current_prompt`: the full text of the current planner instruction
+- `current_prompt_json`: the current artifact (strategy + 5 skills)
 - `score_history`: recent iterations with scores and change descriptions
-- `sub_scores`: per-dimension average scores for the current prompt
+- `sub_scores`: per-dimension average scores for the current artifact
 - `dimension_weights`: the weight of each dimension in the total score
-- `highest_impact_dimension`: dimension where improvement would most increase
-  the weighted total (accounts for both headroom and weight)
+- `highest_impact_dimension`: dimension with most headroom * weight
 - `plateau_detected`: true if scores haven't improved in 3+ iterations
+- `per_query_reasoning`: array of {query_key, reasoning} from the scorer per query
+- `per_query_call_traces`: array of compact call traces per query (may be truncated)
+
+## Diagnosis rules
+
+Use scorer reasoning and call traces to pinpoint which field to improve:
+- Entity lookup failures or poor coverage → `skill_discovery`
+- Poor breadth across many queries → `strategy`
+- Thin or failed fundamentals retrieval → `skill_fundamentals`
+- Thin or failed stock/price data retrieval → `skill_market`
+- News coverage gaps or misuse of narrative evidence → `skill_news`
+- Filing/event retrieval issues → `skill_filings`
+- Overall planning issues (too many iterations, poor batching) → `strategy`
+
+When a `get_properties` call fails, look at the preceding call that motivated it
+to determine which skill owns the failure (it could be skill_fundamentals,
+skill_market, or skill_discovery depending on context).
 
 ## Rules
 
-1. Make **incremental** changes — 1-2 targeted edits per iteration, not wholesale rewrites.
-2. You MUST preserve the JSON response format specification. The planner must still
-   return `{"action": "research"|"done", "reasoning": "...", "calls": [...]}`.
-3. Focus on the **highest_impact_dimension** — this accounts for both the current
-   score gap and the dimension's weight. A small improvement to addressability
-   (weight 0.50) is worth more than a large improvement to efficiency (weight 0.10).
-4. If `plateau_detected` is true, try a more creative or structural change.
-5. Do NOT remove information about available API calls or their parameters.
-6. Do NOT change the fundamental architecture (planner decides, code executes).
+1. Usually modify 1-2 fields per iteration. Use `changed_fields` to declare which.
+2. If `plateau_detected` is true, consider broader changes across multiple fields.
+3. Do NOT change the fundamental architecture (planner decides, code executes).
+4. Every field value must be a non-empty string.
+5. Call traces may be truncated for token budget — work with what's available.
 
 ## Output
 
 Return ONLY a JSON object (no markdown, no explanation):
 
 {
-    "prompt": "<the full modified planner instruction>",
+    "prompt_json": {
+        "strategy": "...",
+        "skill_filings": "...",
+        "skill_fundamentals": "...",
+        "skill_market": "...",
+        "skill_news": "...",
+        "skill_discovery": "..."
+    },
+    "changed_fields": ["skill_market"],
     "change_description": "<1-2 sentences: what you changed and why>"
 }
 """
@@ -80,13 +113,13 @@ BACKOFF_SECONDS = [5, 15, 45]
 
 
 def _get_default_seed() -> str:
-    """Import the researcher's PLANNER_INSTRUCTION as the default seed."""
+    """Return the default optimizable prompt artifact as serialized JSON."""
     try:
-        from researcher.agent import PLANNER_INSTRUCTION
-        return PLANNER_INSTRUCTION
+        from researcher.planner_prompt import DEFAULT_OPTIMIZABLE_PROMPT
+        return json.dumps(DEFAULT_OPTIMIZABLE_PROMPT)
     except ImportError:
         raise RuntimeError(
-            "Cannot import researcher.agent.PLANNER_INSTRUCTION. "
+            "Cannot import researcher.planner_prompt. "
             "Run from the agents/ directory."
         )
 
@@ -107,17 +140,68 @@ def _load_gcp_config() -> tuple[str, str]:
     return "broadchurch", "us-central1"
 
 
+_TRACE_RESULT_CAP = 200
+_TRACE_TOTAL_BUDGET = 8000
+
+
+def _build_call_traces(
+    db: "LearnerDB", prompt_id: int, queries: dict[str, dict],
+) -> list[dict]:
+    """Build compact call traces from stored research output for a prompt's runs.
+
+    Truncates result fields and drops lowest-scoring queries' traces if total
+    exceeds the token budget.
+    """
+    runs = db.get_runs_for_prompt(prompt_id)
+    scored_traces: list[tuple[int, dict]] = []
+
+    for run in runs:
+        raw_output = db.get_run_research_output(run.id)
+        if not raw_output:
+            continue
+        calls = raw_output.get("calls", [])
+        compact_calls = []
+        for c in calls:
+            result_str = str(c.get("result", ""))
+            if len(result_str) > _TRACE_RESULT_CAP:
+                result_str = result_str[:_TRACE_RESULT_CAP] + "…"
+            compact_calls.append({
+                "type": c.get("type", ""),
+                "status": c.get("status", ""),
+                "params": c.get("params", {}),
+                "result": result_str,
+            })
+        scored_traces.append((
+            run.score,
+            {"query_key": run.query_key, "calls": compact_calls},
+        ))
+
+    scored_traces.sort(key=lambda x: x[0], reverse=True)
+
+    result: list[dict] = []
+    total_chars = 0
+    for _score, trace in scored_traces:
+        trace_json = json.dumps(trace, default=str)
+        if total_chars + len(trace_json) > _TRACE_TOTAL_BUDGET and result:
+            break
+        result.append(trace)
+        total_chars += len(trace_json)
+
+    return result
+
+
 def _call_learner_llm(
-    current_prompt: str,
+    current_prompt_json: dict,
     score_history: list[dict],
     sub_scores: dict,
     plateau_detected: bool,
+    per_query_reasoning: list[dict],
+    per_query_call_traces: list[dict],
 ) -> dict:
-    """Ask the learner LLM to generate an improved planner instruction."""
+    """Ask the learner LLM to generate an improved prompt artifact."""
     from google import genai
     from google.genai import types
 
-    # Highest-impact dimension: where (headroom * weight) is greatest
     if sub_scores:
         impact = {
             k: (25 - sub_scores.get(k, 0)) * DIMENSION_WEIGHTS.get(k, 0.25)
@@ -128,19 +212,22 @@ def _call_learner_llm(
         highest_impact = "addressability"
 
     learner_input = json.dumps({
-        "current_prompt": current_prompt,
+        "current_prompt_json": current_prompt_json,
         "score_history": score_history,
         "sub_scores": sub_scores,
         "dimension_weights": DIMENSION_WEIGHTS,
         "highest_impact_dimension": highest_impact,
         "plateau_detected": plateau_detected,
+        "per_query_reasoning": per_query_reasoning,
+        "per_query_call_traces": per_query_call_traces,
     })
 
     LEARNER_MODEL = "gemini-2.5-flash"
     log.info(
         f"Learner LLM call starting (model={LEARNER_MODEL}, highest_impact={highest_impact}, "
         f"plateau={plateau_detected}, history={len(score_history)} entries, "
-        f"prompt {len(current_prompt):,} chars)"
+        f"artifact {len(json.dumps(current_prompt_json)):,} chars, "
+        f"traces={len(per_query_call_traces)})"
     )
 
     t_client = time.monotonic()
@@ -165,9 +252,10 @@ def _call_learner_llm(
             generate_s = time.monotonic() - t_gen
 
             change = result.get("change_description", "")
-            new_len = len(result.get("prompt", ""))
+            changed = result.get("changed_fields", [])
+            new_json = result.get("prompt_json", {})
             log.info(
-                f"Learner LLM returned: new prompt {new_len:,} chars "
+                f"Learner LLM returned: changed_fields={changed} "
                 f"(model={LEARNER_MODEL}, client={client_init_s:.2f}s gen={generate_s:.1f}s)"
             )
             if change:
@@ -400,29 +488,56 @@ def run_learner(
             if plateau:
                 log.info("Plateau detected — learner will try a more creative change")
 
+            # Parse current prompt as JSON artifact
+            try:
+                current_artifact = json.loads(prompt_rec.prompt_text)
+            except (json.JSONDecodeError, TypeError):
+                current_artifact = None
+
+            from researcher.planner_prompt import (
+                DEFAULT_OPTIMIZABLE_PROMPT,
+                validate_artifact,
+            )
+
+            if not validate_artifact(current_artifact):
+                log.warning("Current prompt is not a valid JSON artifact, using defaults")
+                current_artifact = dict(DEFAULT_OPTIMIZABLE_PROMPT)
+
+            per_query_reasoning = db.get_per_query_reasoning(prompt_rec.id)
+            per_query_traces = _build_call_traces(db, prompt_rec.id, queries)
+
             t_learner = time.monotonic()
             learner_llm_s = 0.0
             try:
                 learner_result = _call_learner_llm(
-                    current_prompt=prompt_rec.prompt_text,
+                    current_prompt_json=current_artifact,
                     score_history=score_history,
                     sub_scores=sub,
                     plateau_detected=plateau,
+                    per_query_reasoning=per_query_reasoning,
+                    per_query_call_traces=per_query_traces,
                 )
                 learner_llm_s = time.monotonic() - t_learner
-                new_prompt = learner_result.get("prompt", "")
+                new_artifact = learner_result.get("prompt_json", {})
                 change_desc = learner_result.get("change_description", "")
+                changed_fields = learner_result.get("changed_fields", [])
 
-                if new_prompt and new_prompt != prompt_rec.prompt_text:
+                validated = validate_artifact(new_artifact)
+                if validated and json.dumps(validated, sort_keys=True) != json.dumps(current_artifact, sort_keys=True):
                     db.insert_prompt(
-                        prompt_text=new_prompt,
+                        prompt_text=json.dumps(validated),
                         parent_id=prompt_rec.id,
                         generation=prompt_rec.generation + 1,
                         change_description=change_desc,
                     )
-                    log.info(f"New prompt inserted (gen {prompt_rec.generation + 1}): {change_desc}")
+                    log.info(
+                        f"New artifact inserted (gen {prompt_rec.generation + 1}, "
+                        f"changed={changed_fields}): {change_desc}"
+                    )
+                elif not validated:
+                    log.warning("Learner returned invalid artifact, will retry next iteration")
                 else:
-                    log.warning("Learner returned unchanged prompt, will retry next iteration")
+                    log.warning("Learner returned unchanged artifact, will retry next iteration")
             except Exception as e:
                 learner_llm_s = time.monotonic() - t_learner
                 log.error(f"Learner LLM error: {e}")

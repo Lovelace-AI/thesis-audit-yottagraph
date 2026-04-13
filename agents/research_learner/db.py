@@ -371,6 +371,31 @@ class LearnerDB:
             "efficiency": round(row["efficiency"], 1),
         }
 
+    # -- Diagnostic accessors (for learner) ------------------------------------
+
+    def get_per_query_reasoning(self, prompt_id: int) -> list[dict]:
+        """Return per-query scorer reasoning for a prompt's runs."""
+        rows = self.conn.execute(
+            "SELECT query_key, score_reasoning FROM runs WHERE prompt_id = ? ORDER BY id",
+            (prompt_id,),
+        ).fetchall()
+        return [
+            {"query_key": r["query_key"], "reasoning": r["score_reasoning"] or ""}
+            for r in rows
+        ]
+
+    def get_run_research_output(self, run_id: int) -> dict | None:
+        """Load and parse the stored research_output JSON for a single run."""
+        row = self.conn.execute(
+            "SELECT research_output FROM runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        if not row or not row["research_output"]:
+            return None
+        try:
+            return json.loads(row["research_output"])
+        except (json.JSONDecodeError, TypeError):
+            return None
+
     # -- Reporting helpers -----------------------------------------------------
 
     def get_all_prompts(self) -> list[PromptRecord]:
