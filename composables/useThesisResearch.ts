@@ -524,6 +524,12 @@ export function useThesisResearch() {
             }
 
             queryRewrite.value = qr;
+
+            if (qr.entities.length === 0) {
+                await runResearchAndReport(qr);
+                return;
+            }
+
             status.value = 'awaiting_confirmation';
         } catch (e: any) {
             error.value = e.message || 'Failed to parse thesis.';
