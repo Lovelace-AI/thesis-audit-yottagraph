@@ -55,68 +55,6 @@
             </v-card-text>
         </v-card>
 
-        <!-- Research calls (expandable) -->
-        <v-expansion-panels v-if="report.calls?.length" variant="accordion" class="mt-4">
-            <v-expansion-panel>
-                <v-expansion-panel-title class="provenance-title">
-                    <v-icon size="small" class="mr-2">mdi-database-outline</v-icon>
-                    Research Data
-                    <v-chip size="x-small" variant="tonal" class="ml-2">
-                        {{ report.calls.length }} API calls
-                    </v-chip>
-                </v-expansion-panel-title>
-                <v-expansion-panel-text>
-                    <div v-for="call in report.calls" :key="call.id" class="provenance-step">
-                        <div class="provenance-step-header">
-                            <v-chip size="x-small" variant="tonal" color="primary">
-                                {{ call.type }}
-                            </v-chip>
-                            <span class="provenance-step-args">{{ formatCallParams(call) }}</span>
-                            <v-chip
-                                size="x-small"
-                                :color="call.status === 'ok' ? 'success' : 'error'"
-                                variant="tonal"
-                            >
-                                {{ call.status }}
-                            </v-chip>
-                        </div>
-                        <pre v-if="call.result" class="provenance-step-response">{{
-                            call.result
-                        }}</pre>
-                    </div>
-                </v-expansion-panel-text>
-            </v-expansion-panel>
-        </v-expansion-panels>
-
-        <!-- Show Your Work (full unabridged results) -->
-        <v-expansion-panels v-if="hasShowYourWork" variant="accordion" class="mt-4">
-            <v-expansion-panel>
-                <v-expansion-panel-title class="provenance-title">
-                    <v-icon size="small" class="mr-2">mdi-magnify-scan</v-icon>
-                    Show Your Work
-                    <v-chip size="x-small" variant="tonal" class="ml-2">
-                        {{ showYourWorkCount }} full results
-                    </v-chip>
-                </v-expansion-panel-title>
-                <v-expansion-panel-text>
-                    <div
-                        v-for="(data, callId) in report.show_your_work"
-                        :key="callId"
-                        class="provenance-step"
-                    >
-                        <div class="provenance-step-header">
-                            <v-chip size="x-small" variant="tonal" color="secondary">
-                                Call #{{ callId }}
-                            </v-chip>
-                        </div>
-                        <pre class="provenance-step-response">{{
-                            JSON.stringify(data, null, 2)
-                        }}</pre>
-                    </div>
-                </v-expansion-panel-text>
-            </v-expansion-panel>
-        </v-expansion-panels>
-
         <!-- Research iterations log -->
         <v-expansion-panels v-if="iterations?.length" variant="accordion" class="mt-4">
             <v-expansion-panel>
@@ -148,6 +86,38 @@
                 </v-expansion-panel-text>
             </v-expansion-panel>
         </v-expansion-panels>
+
+        <!-- Research data — each API call individually expandable with raw JSON -->
+        <div v-if="report.calls?.length" class="mt-4">
+            <div class="provenance-section-header">
+                <v-icon size="small" class="mr-2">mdi-database-outline</v-icon>
+                <span class="provenance-title-text">Research Data</span>
+                <v-chip size="x-small" variant="tonal" class="ml-2">
+                    {{ report.calls.length }} API calls
+                </v-chip>
+            </div>
+            <v-expansion-panels variant="accordion" class="mt-2">
+                <v-expansion-panel v-for="call in report.calls" :key="call.id">
+                    <v-expansion-panel-title class="call-panel-title">
+                        <v-chip size="x-small" variant="tonal" color="primary" class="mr-2">
+                            {{ call.type }}
+                        </v-chip>
+                        <span class="call-panel-params">{{ formatCallParams(call) }}</span>
+                        <v-chip
+                            size="x-small"
+                            :color="call.status === 'ok' ? 'success' : 'error'"
+                            variant="tonal"
+                            class="ml-auto"
+                        >
+                            {{ call.status }}
+                        </v-chip>
+                    </v-expansion-panel-title>
+                    <v-expansion-panel-text>
+                        <pre class="provenance-step-response">{{ formatCallJSON(call) }}</pre>
+                    </v-expansion-panel-text>
+                </v-expansion-panel>
+            </v-expansion-panels>
+        </div>
 
         <div class="results-actions">
             <v-btn variant="outlined" @click="$emit('edit')">
@@ -195,15 +165,16 @@
             }));
     });
 
-    const hasShowYourWork = computed(() => {
-        const syw = props.report.show_your_work;
-        return syw && typeof syw === 'object' && Object.keys(syw).length > 0;
-    });
-
-    const showYourWorkCount = computed(() => {
-        const syw = props.report.show_your_work;
-        return syw ? Object.keys(syw).length : 0;
-    });
+    function formatCallJSON(call: any): string {
+        const syw = props.report.show_your_work?.[call.id];
+        const payload = syw ?? call.result ?? call;
+        try {
+            const obj = typeof payload === 'string' ? JSON.parse(payload) : payload;
+            return JSON.stringify(obj, null, 2);
+        } catch {
+            return typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
+        }
+    }
 
     function formatCallParams(call: any): string {
         const params = call.params || {};
@@ -286,6 +257,35 @@
         letter-spacing: 0.05em;
     }
 
+    .provenance-section-header {
+        display: flex;
+        align-items: center;
+        padding: 8px 0;
+    }
+
+    .provenance-title-text {
+        font-family: var(--font-mono);
+        font-size: 0.8rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+
+    .call-panel-title {
+        font-family: var(--font-mono);
+        font-size: 0.75rem;
+    }
+
+    .call-panel-params {
+        font-family: var(--font-mono);
+        font-size: 0.7rem;
+        color: var(--lv-silver);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        flex: 1;
+        min-width: 0;
+    }
+
     .provenance-step {
         padding: 8px 0;
         border-bottom: 1px solid rgba(128, 128, 128, 0.1);
@@ -319,7 +319,7 @@
         margin-top: 4px;
         white-space: pre-wrap;
         word-break: break-word;
-        max-height: 200px;
+        max-height: 60vh;
         overflow-y: auto;
     }
 
