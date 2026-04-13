@@ -861,8 +861,8 @@ def _dispatch_call(call: dict) -> tuple[str, dict]:
 # Abridger — keeps research doc within LLM context budget
 # ---------------------------------------------------------------------------
 
-_MAX_DOC_SIZE = 100_000
-_MAX_PER_RESULT = 10_000
+_MAX_DOC_SIZE = 500_000
+_MAX_PER_RESULT = 20_000
 
 
 def _abridge_value(value: any, budget: int) -> any:
