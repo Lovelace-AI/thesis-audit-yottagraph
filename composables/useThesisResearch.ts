@@ -307,6 +307,13 @@ export function useThesisResearch() {
                     if (data.text) text = data.text;
                     break;
                 } else if (event === 'error') {
+                    const errMsg =
+                        data?.message || data?.error || data?.detail || JSON.stringify(data);
+                    debugRequests.push({
+                        url: '(SSE error event)',
+                        method: 'SSE',
+                        responseText: typeof errMsg === 'string' ? errMsg : JSON.stringify(errMsg),
+                    });
                     return null;
                 }
             }
@@ -444,7 +451,13 @@ export function useThesisResearch() {
     async function runQueryRewrite(qr: QueryRewrite): Promise<any> {
         const message = JSON.stringify(qr);
         const { text } = await sendToAgent('queryRewrite', message);
-        return extractJSON(text);
+        const parsed = extractJSON(text);
+        if (!parsed) {
+            const err = new Error('Query Rewrite Agent returned unparseable response.');
+            (err as any).agentText = text;
+            throw err;
+        }
+        return parsed;
     }
 
     async function resolveEntities(
@@ -514,10 +527,18 @@ export function useThesisResearch() {
             status.value = 'awaiting_confirmation';
         } catch (e: any) {
             error.value = e.message || 'Failed to parse thesis.';
+            const dbgRequests: ErrorDetail['requests'] = (e as any).debugRequests || [];
+            if ((e as any).agentText) {
+                dbgRequests.push({
+                    url: '(agent response text)',
+                    method: 'SSE',
+                    responseText: (e as any).agentText,
+                });
+            }
             errorDetail.value = {
                 message: error.value!,
                 stage: 'Query Rewrite',
-                requests: (e as any).debugRequests || [],
+                requests: dbgRequests,
             };
             status.value = 'error';
         }
@@ -602,10 +623,18 @@ export function useThesisResearch() {
                 status.value = 'awaiting_confirmation';
             } catch (e: any) {
                 error.value = e.message || 'Failed to re-resolve entities.';
+                const dbgRequests: ErrorDetail['requests'] = (e as any).debugRequests || [];
+                if ((e as any).agentText) {
+                    dbgRequests.push({
+                        url: '(agent response text)',
+                        method: 'SSE',
+                        responseText: (e as any).agentText,
+                    });
+                }
                 errorDetail.value = {
                     message: error.value!,
                     stage: 'Entity Re-resolution',
-                    requests: (e as any).debugRequests || [],
+                    requests: dbgRequests,
                 };
                 status.value = 'error';
             }
