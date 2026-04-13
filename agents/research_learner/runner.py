@@ -27,6 +27,7 @@ log = get_logger("runner")
 
 MAX_RETRIES = 3
 BACKOFF_SECONDS = [5, 15, 45]
+LLM_CALL_TIMEOUT = 120  # seconds before we consider a generate_content call hung
 
 
 @dataclass
@@ -80,19 +81,24 @@ def _call_planner(research_doc_json: str, instruction: str) -> _TimedLLMResult:
     client = genai.Client(vertexai=True, project=project, location=region)
     client_init_s = time.monotonic() - t_client
 
+    def _generate() -> any:
+        return client.models.generate_content(
+            model=PLANNER_MODEL,
+            contents=research_doc_json,
+            config=types.GenerateContentConfig(
+                system_instruction=instruction,
+                response_mime_type="application/json",
+                temperature=0.0,
+            ),
+        )
+
     last_error: Exception | None = None
     for attempt in range(MAX_RETRIES):
         try:
             t_gen = time.monotonic()
-            response = client.models.generate_content(
-                model=PLANNER_MODEL,
-                contents=research_doc_json,
-                config=types.GenerateContentConfig(
-                    system_instruction=instruction,
-                    response_mime_type="application/json",
-                    temperature=0.0,
-                ),
-            )
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_generate)
+                response = future.result(timeout=LLM_CALL_TIMEOUT)
             result = json.loads(response.text)
             generate_s = time.monotonic() - t_gen
 
@@ -108,6 +114,15 @@ def _call_planner(research_doc_json: str, instruction: str) -> _TimedLLMResult:
                 result=result,
                 client_init_s=client_init_s,
                 generate_s=generate_s,
+            )
+        except TimeoutError:
+            generate_s = time.monotonic() - t_gen
+            log.error(
+                f"Planner LLM call timed out after {generate_s:.0f}s "
+                f"(attempt {attempt+1}/{MAX_RETRIES})"
+            )
+            last_error = TimeoutError(
+                f"generate_content hung for {generate_s:.0f}s"
             )
         except Exception as e:
             last_error = e
