@@ -68,13 +68,31 @@
                 <v-expansion-panel-text>
                     <div v-for="iter in iterations" :key="iter.id" class="provenance-step">
                         <div class="provenance-step-header">
-                            <v-chip size="x-small" variant="tonal" color="primary">
+                            <v-chip
+                                v-if="iter.stopReason"
+                                size="x-small"
+                                variant="tonal"
+                                :color="iter.stopReason === 'complete' ? 'success' : 'warning'"
+                            >
+                                <v-icon start size="x-small">{{
+                                    iter.stopReason === 'complete'
+                                        ? 'mdi-check-circle-outline'
+                                        : iter.stopReason === 'max_iterations'
+                                          ? 'mdi-timer-alert-outline'
+                                          : 'mdi-alert-circle-outline'
+                                }}</v-icon>
+                                {{ stopReasonLabel(iter.stopReason) }}
+                            </v-chip>
+                            <v-chip v-else size="x-small" variant="tonal" color="primary">
                                 Iteration {{ iter.iteration }}
                             </v-chip>
-                            <span v-if="iter.reasoning" class="provenance-step-args">
-                                {{ iter.reasoning }}
-                            </span>
                         </div>
+                        <div v-if="iter.stopReason && iter.reasoning" class="stop-reasoning">
+                            {{ iter.reasoning }}
+                        </div>
+                        <span v-else-if="iter.reasoning" class="provenance-step-args">
+                            {{ iter.reasoning }}
+                        </span>
                         <div v-for="call in iter.calls" :key="call.id" class="iteration-call">
                             <v-icon size="x-small" class="mr-1">{{
                                 TOOL_ICONS[call.type] || 'mdi-cog-outline'
@@ -173,6 +191,19 @@
             return JSON.stringify(obj, null, 2);
         } catch {
             return typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
+        }
+    }
+
+    function stopReasonLabel(reason: string): string {
+        switch (reason) {
+            case 'complete':
+                return 'Research Complete';
+            case 'max_iterations':
+                return 'Iteration Limit Reached';
+            case 'planner_error':
+                return 'Stopped Due to Error';
+            default:
+                return 'Concluded';
         }
     }
 
@@ -306,6 +337,17 @@
         font-family: var(--font-mono);
         font-size: 0.7rem;
         color: var(--lv-silver);
+    }
+
+    .stop-reasoning {
+        font-size: 0.8rem;
+        line-height: 1.6;
+        color: rgba(var(--v-theme-on-surface), 0.8);
+        background: rgba(128, 128, 128, 0.06);
+        border-radius: 4px;
+        padding: 8px 12px;
+        margin-top: 6px;
+        white-space: pre-wrap;
     }
 
     .provenance-step-response {

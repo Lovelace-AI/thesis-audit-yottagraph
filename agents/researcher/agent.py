@@ -1179,7 +1179,10 @@ def research_iteration(input_json: str = "") -> str:
     _iteration_counter += 1
 
     if _iteration_counter > _max_iterations:
-        result = _build_final_result("Maximum iterations reached.")
+        result = _build_final_result(
+            f"Maximum iterations reached ({_max_iterations}).",
+            stop_reason="max_iterations",
+        )
         _reset_state()
         return json.dumps(result, default=str)
 
@@ -1187,12 +1190,17 @@ def research_iteration(input_json: str = "") -> str:
     try:
         plan = _call_planner_llm(prompt)
     except Exception as e:
-        result = _build_final_result(f"Planner error: {e}")
+        result = _build_final_result(
+            f"Planner error: {e}", stop_reason="planner_error",
+        )
         _reset_state()
         return json.dumps(result, default=str)
 
     if plan.get("action") == "done":
-        result = _build_final_result(plan.get("reasoning", "Research complete."))
+        result = _build_final_result(
+            plan.get("reasoning", "Research complete."),
+            stop_reason="complete",
+        )
         _reset_state()
         return json.dumps(result, default=str)
 
@@ -1223,12 +1231,13 @@ def research_iteration(input_json: str = "") -> str:
     )
 
 
-def _build_final_result(reasoning: str) -> dict:
+def _build_final_result(reasoning: str, stop_reason: str = "complete") -> dict:
     """Build the final output with both research doc and full show_your_work."""
     return {
         "status": "done",
         "iteration": _iteration_counter,
         "reasoning": reasoning,
+        "stop_reason": stop_reason,
         "calls_made": [],
         "final": {
             "research": _research_doc,

@@ -64,6 +64,7 @@ export interface ResearchIteration {
     timestamp: number;
     status: 'planning' | 'executing' | 'done';
     calls: ResearchCallResult[];
+    stopReason?: 'complete' | 'max_iterations' | 'planner_error';
 }
 
 export interface EntitySelection {
@@ -292,6 +293,9 @@ export function useThesisResearch() {
                                     status: c.status || 'ok',
                                     summary: c.result || '',
                                 }));
+                                if (parsed.stop_reason) {
+                                    latest.stopReason = parsed.stop_reason;
+                                }
                                 progress.value = iterations;
                             }
 

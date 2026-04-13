@@ -46,7 +46,7 @@ Return a JSON object with one of these two structures:
 ### Research complete:
 {
     "action": "done",
-    "reasoning": "Brief explanation of why you have enough data"
+    "reasoning": "Specific explanation: which claims have supporting data, which lack data and why (e.g. entity has no filings, no news coverage found), and what evidence gaps remain."
 }
 
 ## Available API calls
@@ -128,7 +128,9 @@ to understand what data exists, or use get_relationships to find related entitie
 same call. If multiple calls fail for an entity, that entity's data is unavailable.
 - Don't over-fetch: 3-4 iterations is typical. Use limits and filters.
 - Know when to stop: say "done" when you have sufficient evidence to address \
-every claim in the thesis, or after exhausting useful avenues.
+every claim in the thesis, or after exhausting useful avenues. Your "done" \
+reasoning MUST cite each claim and whether you found data for it, plus any \
+gaps you could not fill and why (e.g. "no SEC filings found for entity X").
 - Plan around claims: for each claim in query.claims, identify what data would \
 confirm or deny it and make sure you fetch that data.\
 """
