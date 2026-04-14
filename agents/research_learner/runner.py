@@ -94,11 +94,12 @@ def _call_planner(research_doc_json: str, instruction: str) -> _TimedLLMResult:
 
     last_error: Exception | None = None
     for attempt in range(MAX_RETRIES):
+        pool = ThreadPoolExecutor(max_workers=1)
         try:
             t_gen = time.monotonic()
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(_generate)
-                response = future.result(timeout=LLM_CALL_TIMEOUT)
+            future = pool.submit(_generate)
+            response = future.result(timeout=LLM_CALL_TIMEOUT)
+            pool.shutdown(wait=False)
             result = json.loads(response.text)
             generate_s = time.monotonic() - t_gen
 
@@ -116,6 +117,7 @@ def _call_planner(research_doc_json: str, instruction: str) -> _TimedLLMResult:
                 generate_s=generate_s,
             )
         except TimeoutError:
+            pool.shutdown(wait=False)
             generate_s = time.monotonic() - t_gen
             log.error(
                 f"Planner LLM call timed out after {generate_s:.0f}s "
@@ -125,6 +127,7 @@ def _call_planner(research_doc_json: str, instruction: str) -> _TimedLLMResult:
                 f"generate_content hung for {generate_s:.0f}s"
             )
         except Exception as e:
+            pool.shutdown(wait=False)
             last_error = e
             err_str = str(e)
             if "429" in err_str or "503" in err_str or "RESOURCE_EXHAUSTED" in err_str:
