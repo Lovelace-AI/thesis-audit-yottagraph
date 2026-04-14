@@ -11,6 +11,7 @@ Each dimension is scored 0-25, then the weighted total (0-100) is computed:
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -102,6 +103,7 @@ DIMENSION_WEIGHTS = {
 
 MAX_RETRIES = 3
 BACKOFF_SECONDS = [5, 15, 45]
+LLM_CALL_TIMEOUT = 120
 
 
 @dataclass
@@ -162,20 +164,25 @@ def score_research(query: dict, research_doc: dict) -> ScoreResult:
     client = genai.Client(vertexai=True, project=project, location=region)
     client_init_s = time.monotonic() - t_client
 
+    def _generate() -> any:
+        return client.models.generate_content(
+            model=SCORER_MODEL,
+            contents=scorer_input,
+            config=types.GenerateContentConfig(
+                system_instruction=SCORER_INSTRUCTION,
+                response_mime_type="application/json",
+                temperature=0.1,
+            ),
+        )
+
     t_retries = time.monotonic()
     last_error: Exception | None = None
     for attempt in range(MAX_RETRIES):
         try:
             t_gen = time.monotonic()
-            response = client.models.generate_content(
-                model=SCORER_MODEL,
-                contents=scorer_input,
-                config=types.GenerateContentConfig(
-                    system_instruction=SCORER_INSTRUCTION,
-                    response_mime_type="application/json",
-                    temperature=0.1,
-                ),
-            )
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_generate)
+                response = future.result(timeout=LLM_CALL_TIMEOUT)
             result = json.loads(response.text)
             generate_s = time.monotonic() - t_gen
 
@@ -205,6 +212,15 @@ def score_research(query: dict, research_doc: dict) -> ScoreResult:
                 addressability=addressability,
                 efficiency=efficiency,
                 reasoning=str(result.get("reasoning", "")),
+            )
+        except TimeoutError:
+            generate_s = time.monotonic() - t_gen
+            log.error(
+                f"Scorer LLM call timed out after {generate_s:.0f}s "
+                f"(attempt {attempt+1}/{MAX_RETRIES})"
+            )
+            last_error = TimeoutError(
+                f"generate_content hung for {generate_s:.0f}s"
             )
         except Exception as e:
             last_error = e

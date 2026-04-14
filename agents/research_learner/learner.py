@@ -7,6 +7,7 @@ Each iteration: run research with current prompt → score → record → genera
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -173,6 +174,7 @@ Set to an earlier prompt_id from score_history to branch from that prompt instea
 
 MAX_RETRIES = 3
 BACKOFF_SECONDS = [5, 15, 45]
+LLM_CALL_TIMEOUT = 180  # learner uses a bigger model, give it more time
 
 
 def _get_default_seed() -> str:
@@ -307,19 +309,24 @@ def _call_learner_llm(
     client = genai.Client(vertexai=True, project=project, location=region)
     client_init_s = time.monotonic() - t_client
 
+    def _generate() -> any:
+        return client.models.generate_content(
+            model=LEARNER_MODEL,
+            contents=learner_input,
+            config=types.GenerateContentConfig(
+                system_instruction=LEARNER_INSTRUCTION,
+                response_mime_type="application/json",
+                temperature=0.4,
+            ),
+        )
+
     last_error: Exception | None = None
     for attempt in range(MAX_RETRIES):
         try:
             t_gen = time.monotonic()
-            response = client.models.generate_content(
-                model=LEARNER_MODEL,
-                contents=learner_input,
-                config=types.GenerateContentConfig(
-                    system_instruction=LEARNER_INSTRUCTION,
-                    response_mime_type="application/json",
-                    temperature=0.4,
-                ),
-            )
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_generate)
+                response = future.result(timeout=LLM_CALL_TIMEOUT)
             result = json.loads(response.text)
             generate_s = time.monotonic() - t_gen
 
@@ -335,6 +342,15 @@ def _call_learner_llm(
             if change:
                 log.info(f"Learner change: {change}")
             return result
+        except TimeoutError:
+            generate_s = time.monotonic() - t_gen
+            log.error(
+                f"Learner LLM call timed out after {generate_s:.0f}s "
+                f"(attempt {attempt+1}/{MAX_RETRIES})"
+            )
+            last_error = TimeoutError(
+                f"generate_content hung for {generate_s:.0f}s"
+            )
         except Exception as e:
             last_error = e
             err_str = str(e)
