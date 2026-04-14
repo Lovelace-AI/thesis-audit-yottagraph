@@ -107,8 +107,12 @@ ARTIFACT_KEYS = frozenset([
 _DEFAULT_STRATEGY = """\
 - Map each item in `data_needs` to the appropriate call types: \
 "market_data" → get_properties on financial_instrument (see skill_market), \
-"fundamentals" → get_properties with financial fields (see skill_fundamentals), \
-"news" → get_news, "filings" → get_filings, "events" → get_events.
+"fundamentals" or "filings" → get_properties with us_gaap:* fields on organization \
+(see skill_fundamentals), \
+"news" → get_news, "events" → get_events.
+- Use `get_filings` ONLY for Form 4 (insider trades) and 8-K event filings. \
+Do NOT use get_filings for 10-K/10-Q — that financial data lives directly on \
+the organization entity as us_gaap:* properties (see skill_fundamentals).
 - Start broad: first iteration should cover all entities with their primary data needs.
 - Batch calls: request multiple calls per iteration rather than one at a time.
 - Use `data_needs` from the query to decide which call types to use. Cover all of them.
@@ -139,14 +143,24 @@ _DEFAULT_SKILL_FILINGS = """\
 
 **Calls**: get_filings, get_events
 
-### Filing types
-- 10-K (annual), 10-Q (quarterly): financial statements and disclosures.
-- 8-K: material event disclosure.
-- Form 4: insider transactions — check `transaction_type` and `shares_transacted`.
-- 13D/G: beneficial ownership. 13F-HR: institutional holdings. DEF 14A: proxy.
+### Critical: what `get_filings` can and cannot find
+
+The KG stores filing ENTITIES only for Form 4 (insider transactions) and \
+8-K (material events). 10-K and 10-Q filing entities do NOT exist in the graph.
+
+**Do NOT call `get_filings` with form_types ["10-K", "10-Q"]** — it will \
+always return empty. The financial data from 10-K/10-Q filings is \
+denormalized into `us_gaap:*` properties directly on the organization \
+entity. Use `get_properties` with us_gaap:* fields instead (see \
+skill_fundamentals).
+
+### What `get_filings` IS useful for
+- **Form 4**: insider transactions — check `transaction_type` and `shares_transacted`.
+- **8-K**: material event filings.
+- **13D/G**: beneficial ownership. **13F-HR**: institutional holdings.
 
 ### Usage
-- Use `form_types` to filter (e.g. ["10-K", "10-Q"] for financials, ["Form 4"] for insider trades).
+- Use `form_types` to filter, e.g. ["Form 4"] for insider trades.
 - Use `limit` to cap results (default 20).
 
 ### Events
@@ -156,9 +170,10 @@ leadership changes, regulatory actions), NOT news-derived events.
 no 8-K filing was made. Use `get_news` for broader event coverage.
 
 ### Common patterns
-- Compare filing dates and types across entities to identify event timing.
+- Compare filing dates across entities to identify event timing.
 - Use Form 4 data to assess insider confidence (buying vs selling).
-- After finding filings, use `get_properties` to get the financial data from them.\
+- For financial statement data (revenue, income, EPS), always use \
+`get_properties` with us_gaap:* fields on the organization entity.\
 """
 
 _DEFAULT_SKILL_FUNDAMENTALS = """\
@@ -166,10 +181,13 @@ _DEFAULT_SKILL_FUNDAMENTALS = """\
 
 **Calls**: get_properties, search_entities
 
-### Key concept: fundamentals live on organization entities
+### Key concept: XBRL data is denormalized onto organization entities
 
-Financial statement data (revenue, net income, EPS, etc.) is stored on \
-`organization` entities that file with the SEC (have a CIK number).
+Financial statement data from 10-K and 10-Q filings is stored directly on \
+`organization` entities as `us_gaap:*` properties. This is the primary \
+source for revenue, income, assets, and other financial metrics. \
+Do NOT try to fetch 10-K/10-Q via `get_filings` — those filing entities \
+don't exist in the KG.
 
 ### How to fetch fundamentals
 
@@ -177,22 +195,50 @@ Financial statement data (revenue, net income, EPS, etc.) is stored on \
    - If `organization`: go to step 2.
    - If `financial_instrument`: use `search_entities` to find the parent \
 organization, then proceed to step 2.
-2. Fetch fundamentals:
-   `get_properties` on the organization NEID with \
-`properties: ["total_revenue", "net_income", "total_assets", \
-"total_liabilities", "shareholders_equity", "shares_outstanding", \
-"eps_basic", "eps_diluted"]`
+2. Fetch fundamentals using `us_gaap:*` property names:
+   `get_properties` on the organization NEID with properties from this list:
+
+**Income statement**: `us_gaap:revenues`, `us_gaap:revenue_from_contracts`, \
+`us_gaap:cogs`, `us_gaap:gross_profit`, `us_gaap:operating_income_loss`, \
+`us_gaap:net_income_loss`, `us_gaap:profit_loss`, `us_gaap:eps_basic_xbrl`, \
+`us_gaap:eps_diluted_xbrl`, `us_gaap:operating_expenses`, \
+`us_gaap:sg_and_a`, `us_gaap:research_and_development`, \
+`us_gaap:interest_expense`, `us_gaap:income_tax_expense`
+
+**Balance sheet**: `us_gaap:assets`, `us_gaap:assets_current`, \
+`us_gaap:liabilities`, `us_gaap:liabilities_current`, \
+`us_gaap:stockholders_equity`, `us_gaap:stockholders_equity_total`, \
+`us_gaap:cash_and_cash_equivalents`, `us_gaap:cash`, \
+`us_gaap:inventory_net`, `us_gaap:accounts_receivable_current`, \
+`us_gaap:accounts_payable_current`, `us_gaap:long_term_debt`, \
+`us_gaap:total_debt`, `us_gaap:goodwill`, `us_gaap:pp_and_e_net`, \
+`us_gaap:retained_earnings`
+
+**Cash flow**: `us_gaap:operating_cash_flow`, `us_gaap:investing_cash_flow`, \
+`us_gaap:financing_cash_flow`, `us_gaap:capex_paid`, \
+`us_gaap:depreciation_and_amortization`
+
+**Shares**: `us_gaap:common_shares_outstanding`, \
+`us_gaap:weighted_avg_shares_basic`, `us_gaap:weighted_avg_shares_diluted`
+
+Pick only the properties relevant to the claims. Do not fetch all of them.
+
+### Legacy property names
+
+Some organizations also have non-prefixed property names: \
+`total_revenue`, `net_income`, `total_assets`, `total_liabilities`, \
+`shareholders_equity`, `shares_outstanding`, `eps_basic`, `eps_diluted`. \
+Try `us_gaap:*` names first; fall back to these if empty.
 
 ### Important
 
 - Do NOT expect fundamentals on `financial_instrument` entities. \
 They live on the parent `organization`.
-- If `get_properties` returns empty for these fields, the entity may not \
-be an SEC filer. Check with `get_properties` using `["company_cik", \
-"ticker_symbol"]` to verify.
-- For FDIC-regulated banks, try bank-specific property names: \
-`["net_interest_income", "total_deposits", "total_loans", \
-"provision_for_loan_losses", "return_on_assets"]`.
+- If `get_properties` returns empty, the entity may not be an SEC filer. \
+Check with `get_properties` using `["company_cik", "ticker_symbol"]`.
+- For FDIC-regulated banks, try: `["net_interest_income", "total_deposits", \
+"total_loans", "provision_for_loan_losses", "return_on_assets", \
+"return_on_equity"]`.
 - Always specify the property names you want. Never omit `properties`.\
 """
 

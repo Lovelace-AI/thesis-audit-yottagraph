@@ -144,6 +144,24 @@ Return ONLY a JSON object (no markdown, no explanation):
 }
 """
 
+LEARNER_SCHEMA_HINT_ADDENDUM = """
+## Schema misunderstanding hints
+
+The input includes a `schema_hints` array. Each hint identifies a pattern where \
+the researcher consistently failed to find data, and provides information from \
+the actual KG schema about where that data actually lives.
+
+**This is high-priority information.** When schema hints are present, they \
+indicate the current skills are directing the planner to look for data in the \
+wrong place. Update the relevant skill to use the correct property names or \
+call types shown in the hints.
+
+Example: if a hint says `get_filings` with form_type=10-K always fails and \
+the data lives in `us_gaap:*` properties, update `skill_filings` and/or \
+`skill_fundamentals` to direct the planner to use `get_properties` with \
+the correct `us_gaap:*` property names instead.
+"""
+
 LEARNER_BRANCH_ADDENDUM = """
 ## Branching
 
@@ -201,6 +219,185 @@ def _load_gcp_config() -> tuple[str, str]:
 
 _TRACE_RESULT_CAP = 500
 _TRACE_TOTAL_BUDGET = 40_000
+
+# ---------------------------------------------------------------------------
+# Schema introspection — detect when the researcher is asking for data
+# using the wrong property names or call types
+# ---------------------------------------------------------------------------
+
+_DATA_MODEL_DIR = Path(__file__).resolve().parent.parent.parent / ".cursor" / "skills" / "data-model"
+
+_schema_cache: list[dict] | None = None
+
+
+def _load_data_model_schema() -> list[dict]:
+    """Load property definitions from all schema.yaml files in the data-model skill.
+
+    Returns a flat list of property dicts, each with at least:
+      name, type, description, domain_flavors, source (schema filename)
+
+    Much richer than the live QS /schema endpoint because it includes
+    descriptions, domain_flavors, display_names, and examples.
+    Cached after first call.
+    """
+    global _schema_cache
+    if _schema_cache is not None:
+        return _schema_cache
+
+    import yaml
+
+    all_props: list[dict] = []
+    schema_dir = _DATA_MODEL_DIR
+    if not schema_dir.is_dir():
+        log.warning(f"Data model directory not found: {schema_dir}")
+        _schema_cache = []
+        return _schema_cache
+
+    for yaml_path in sorted(schema_dir.rglob("schema.yaml")):
+        try:
+            with open(yaml_path) as f:
+                schema = yaml.safe_load(f) or {}
+            source = yaml_path.parent.name
+            for p in schema.get("properties", []):
+                p["source"] = source
+                all_props.append(p)
+        except Exception as e:
+            log.warning(f"Failed to load {yaml_path}: {e}")
+
+    _schema_cache = all_props
+    sources = {p["source"] for p in all_props}
+    log.info(
+        f"Loaded data model schema: {len(all_props)} properties "
+        f"from {len(sources)} sources ({', '.join(sorted(sources))})"
+    )
+    return _schema_cache
+
+
+def _schema_props_by_prefix() -> dict[str, list[str]]:
+    """Group schema property names by prefix (e.g. us_gaap → [revenues, ...])."""
+    grouped: dict[str, list[str]] = {}
+    for p in _load_data_model_schema():
+        name = p.get("name", "")
+        if not name:
+            continue
+        if ":" in name:
+            prefix, suffix = name.split(":", 1)
+            grouped.setdefault(prefix, []).append(suffix)
+        else:
+            grouped.setdefault("", []).append(name)
+    return grouped
+
+
+def _detect_schema_misunderstandings(
+    per_query_traces: list[dict],
+) -> list[dict]:
+    """Analyze call traces to find patterns where the researcher consistently
+    gets no data, suggesting it's looking for data in the wrong place.
+
+    Uses the rich data-model schema.yaml files to provide descriptions,
+    domain_flavors, and concrete alternatives.
+
+    Returns a list of hint dicts for the learner, each describing a
+    misunderstanding and what the schema actually offers.
+    """
+    all_props = _load_data_model_schema()
+    if not all_props:
+        return []
+
+    by_prefix = _schema_props_by_prefix()
+    by_name: dict[str, dict] = {p["name"]: p for p in all_props if p.get("name")}
+
+    failed_filing_types: dict[str, int] = {}
+    empty_property_names: dict[str, int] = {}
+    total_queries = len(per_query_traces)
+
+    for trace in per_query_traces:
+        calls = trace.get("calls", [])
+        for call in calls:
+            call_type = call.get("type", "")
+            status = call.get("status", "")
+            result = str(call.get("result", ""))
+            params = call.get("params", {})
+
+            if call_type == "get_filings" and (
+                status == "error" or "No SEC filing data found" in result
+                or "No filings found" in result
+            ):
+                form_types = params.get("form_types", [])
+                for ft in (form_types or ["unfiltered"]):
+                    failed_filing_types[ft] = failed_filing_types.get(ft, 0) + 1
+
+            if call_type == "get_properties" and (
+                status == "error" or "0 value(s)" in result
+                or "none" in result.lower()
+            ):
+                props = params.get("properties", [])
+                for prop in (props or []):
+                    empty_property_names[prop] = empty_property_names.get(prop, 0) + 1
+
+    hints: list[dict] = []
+    min_failures = max(2, total_queries // 3)
+
+    for ft, count in failed_filing_types.items():
+        if count >= min_failures and ft.upper() in ("10-K", "10-Q"):
+            us_gaap_names = by_prefix.get("us_gaap", [])
+            if us_gaap_names:
+                org_financial_props = [
+                    {
+                        "name": p["name"],
+                        "description": p.get("description", ""),
+                        "domain_flavors": p.get("domain_flavors", []),
+                    }
+                    for p in all_props
+                    if p.get("name", "").startswith("us_gaap:")
+                    and "organization" in (p.get("domain_flavors") or [])
+                ][:30]
+                hints.append({
+                    "issue": f"get_filings with form_type={ft} failed {count} times",
+                    "explanation": (
+                        f"10-K/10-Q filing entities don't exist in this KG. "
+                        f"The financial data from those filings is denormalized "
+                        f"directly onto organization entities as us_gaap:* "
+                        f"properties. Use get_properties on the org NEID with "
+                        f"these property names instead of get_filings."
+                    ),
+                    "available_properties": org_financial_props,
+                })
+
+    persistently_empty = [
+        name for name, count in empty_property_names.items()
+        if count >= min_failures
+    ]
+    if persistently_empty:
+        similar: dict[str, list[dict]] = {}
+        for bad_name in persistently_empty:
+            stem = bad_name.replace("us_gaap:", "").replace("_", "").lower()
+            matches = []
+            for p in all_props:
+                pn = p.get("name", "")
+                pn_norm = pn.replace("_", "").replace("us_gaap:", "").lower()
+                if stem in pn_norm or pn_norm in stem:
+                    matches.append({
+                        "name": pn,
+                        "description": p.get("description", ""),
+                        "domain_flavors": p.get("domain_flavors", []),
+                        "source": p.get("source", ""),
+                    })
+            if matches:
+                similar[bad_name] = matches[:5]
+
+        if similar:
+            hints.append({
+                "issue": f"Properties {persistently_empty[:10]} consistently return empty",
+                "explanation": (
+                    "These property names may not exist in the schema or may "
+                    "be named differently. The alternatives below include "
+                    "domain_flavors showing which entity types carry each property."
+                ),
+                "suggested_alternatives": similar,
+            })
+
+    return hints
 
 
 def _build_call_traces(
@@ -261,6 +458,7 @@ def _call_learner_llm(
     best_prompt_id: int | None = None,
     best_prompt_avg_score: float | None = None,
     branching_enabled: bool = False,
+    schema_hints: list[dict] | None = None,
 ) -> dict:
     """Ask the learner LLM to generate an improved prompt artifact."""
     from google import genai
@@ -286,6 +484,8 @@ def _call_learner_llm(
         "per_query_scores": per_query_scores or [],
         "per_query_call_traces": per_query_call_traces,
     }
+    if schema_hints:
+        input_payload["schema_hints"] = schema_hints
     if branching_enabled:
         input_payload["best_prompt_json"] = best_prompt_json
         input_payload["best_prompt_id"] = best_prompt_id
@@ -293,17 +493,20 @@ def _call_learner_llm(
     learner_input = json.dumps(input_payload)
 
     instruction = LEARNER_INSTRUCTION
+    if schema_hints:
+        instruction += LEARNER_SCHEMA_HINT_ADDENDUM
     if branching_enabled:
         instruction += LEARNER_BRANCH_ADDENDUM
 
     LEARNER_MODEL = "gemini-2.5-flash"
     best_info = f", best_prompt={best_prompt_id} avg={best_prompt_avg_score:.1f}" if best_prompt_id else ""
     branch_str = ", branching=enabled" if branching_enabled else ""
+    schema_str = f", schema_hints={len(schema_hints)}" if schema_hints else ""
     log.info(
         f"Learner LLM call starting (model={LEARNER_MODEL}, highest_impact={highest_impact}, "
         f"plateau={plateau_detected}, history={len(score_history)} entries, "
         f"artifact {len(json.dumps(current_prompt_json)):,} chars, "
-        f"traces={len(per_query_call_traces)}{best_info}{branch_str})"
+        f"traces={len(per_query_call_traces)}{best_info}{branch_str}{schema_str})"
     )
 
     t_client = time.monotonic()
@@ -629,6 +832,13 @@ def run_learner(
                 for r in results
             ]
 
+            schema_hints = _detect_schema_misunderstandings(per_query_traces)
+            if schema_hints:
+                log.info(
+                    f"Schema misunderstanding detected: {len(schema_hints)} hint(s) — "
+                    + "; ".join(h.get("issue", "?") for h in schema_hints)
+                )
+
             # Branching: only reveal the option to the LLM when
             # the last 3+ consecutive iterations all scored 5+ pts
             # below the best-ever.  Otherwise the LLM doesn't even
@@ -673,6 +883,7 @@ def run_learner(
                     best_prompt_id=best_prompt_id,
                     best_prompt_avg_score=best_prompt_avg_score,
                     branching_enabled=branching_enabled,
+                    schema_hints=schema_hints,
                 )
                 learner_llm_s = time.monotonic() - t_learner
                 new_artifact = learner_result.get("prompt_json", {})
