@@ -43,6 +43,7 @@ def _load_config() -> dict:
     for candidate in [
         Path("broadchurch.yaml"),
         Path(__file__).parent / "broadchurch.yaml",
+        Path(__file__).parent.parent / "broadchurch.yaml",
     ]:
         if candidate.exists():
             with open(candidate) as f:
