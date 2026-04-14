@@ -58,11 +58,13 @@ Search for entities by name. Returns matching NEIDs, names, flavors, and match s
 - **flavors** (optional list): filter by entity type, e.g. ["organization", "financial_instrument"]
 - **max_results** (optional int, default 5): cap on results
 
-### get_properties(entity_name, neid, properties?, limit?)
+### get_properties(entity_name, neid, properties, limit?)
 Fetch specific named properties for an entity.
 - **entity_name** (required): human-readable name
 - **neid** (required): entity NEID
-- **properties** (optional list): property names to fetch. Omit to fetch all (expensive).
+- **properties** (required list): property names to fetch. Must be a non-empty list, \
+e.g. ["total_revenue", "net_income"] or ["close_price", "trading_volume"]. \
+Always specify exactly the properties you need.
 - **limit** (optional int, default 10): max values per property
 
 ### get_news(entity_name, neid, limit?)
@@ -188,13 +190,10 @@ They live on the parent `organization`.
 - If `get_properties` returns empty for these fields, the entity may not \
 be an SEC filer. Check with `get_properties` using `["company_cik", \
 "ticker_symbol"]` to verify.
-- For FDIC-regulated banks, financial data may use different property \
-names than standard EDGAR fields. Use `get_properties` without a \
-specific property list to explore.
-
-### Deeper data
-- For XBRL-specific fields beyond the standard set, use `get_properties` \
-with explicit property names.\
+- For FDIC-regulated banks, try bank-specific property names: \
+`["net_interest_income", "total_deposits", "total_loans", \
+"provision_for_loan_losses", "return_on_assets"]`.
+- Always specify the property names you want. Never omit `properties`.\
 """
 
 _DEFAULT_SKILL_MARKET = """\
@@ -232,7 +231,8 @@ Note this and move on.
 
 ### FRED macro data
 - FRED economic series (GDP, CPI, unemployment) are stored as separate entities.
-- Use `search_entities` to find a FRED series, then `get_properties` to fetch values.\
+- Use `search_entities` to find a FRED series, then `get_properties` with \
+the specific series property name to fetch values.\
 """
 
 _DEFAULT_SKILL_NEWS = """\

@@ -365,10 +365,22 @@ def _exec_get_properties(
 ) -> tuple[str, dict]:
     """Fetch specific named properties for an entity.
 
-    If properties is None, returns all properties (capped by limit per PID).
+    `properties` is required and must be a non-empty list of property names.
     """
+    if not properties:
+        return (
+            f"Error: 'properties' list is required for get_properties. "
+            f"Specify which properties to fetch, e.g. "
+            f'["ticker_symbol", "total_revenue", "close_price"].'
+        ), {}
+
     _load_schema()
     pids = _resolve_pids(properties)
+    if not pids:
+        return (
+            f"None of the requested properties {properties} were recognized. "
+            f"Check property names against the available schema."
+        ), {}
 
     try:
         values = _fetch_properties([neid], pids=pids, timeout=30.0)
@@ -378,18 +390,11 @@ def _exec_get_properties(
         unique_pids = list({v.get("pid") for v in values})
         prop_names = sorted({_pname(pid) for pid in unique_pids if _pname(pid)})
 
-        if properties:
-            requested = ", ".join(properties)
-            return (
-                f"Found {len(values)} value(s) for '{entity_name}' "
-                f"(requested: {requested}). "
-                f"Properties present: {', '.join(prop_names) if prop_names else 'none'}."
-            ), {"properties": values, "property_names": prop_names}
-
+        requested = ", ".join(properties)
         return (
             f"Found {len(values)} value(s) for '{entity_name}' "
-            f"across {len(unique_pids)} properties: "
-            f"{', '.join(prop_names[:15]) if prop_names else '(none)'}."
+            f"(requested: {requested}). "
+            f"Properties present: {', '.join(prop_names) if prop_names else 'none'}."
         ), {"properties": values, "property_names": prop_names}
     except Exception as e:
         return f"Error fetching properties for '{entity_name}': {_error_detail(e)}", {}
@@ -580,7 +585,7 @@ _EXECUTORS = {
 
 _REQUIRED_PARAMS: dict[str, list[str]] = {
     "search_entities": ["query"],
-    "get_properties": ["entity_name", "neid"],
+    "get_properties": ["entity_name", "neid", "properties"],
     "get_news": ["entity_name", "neid"],
     "get_filings": ["entity_name", "neid"],
     "get_events": ["entity_name", "neid"],
