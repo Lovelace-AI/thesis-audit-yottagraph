@@ -60,9 +60,7 @@ Each dimension is scored 0-25, then weighted:
 
 You receive JSON with:
 - `current_prompt_json`: the current artifact (strategy + 5 skills)
-- `score_history`: recent iterations with scores, change descriptions, and `parent_prompt_id`
-  showing how prompts are linked (parent_prompt_id differs from the previous entry's
-  prompt_id when a branch occurred)
+- `score_history`: recent iterations with scores and change descriptions
 - `sub_scores`: per-dimension average scores for the current artifact
 - `dimension_weights`: the weight of each dimension in the total score
 - `highest_impact_dimension`: dimension with most headroom * weight
@@ -70,9 +68,6 @@ You receive JSON with:
 - `per_query_scores`: array of {query_key, score, coverage, breadth, addressability, efficiency} — numeric scores per query so you can identify which queries are dragging the average down
 - `per_query_reasoning`: array of {query_key, reasoning} from the scorer per query
 - `per_query_call_traces`: array of compact call traces per query (may be truncated)
-- `best_prompt_json`: the artifact JSON for the highest-scoring prompt (null if same as current)
-- `best_prompt_id`: the prompt id of the best-scoring prompt (null if same as current)
-- `best_prompt_avg_score`: average score of the best-scoring prompt (null if same as current)
 
 ## Diagnosis rules
 
@@ -123,25 +118,6 @@ Also examine `per_query_scores`: if specific queries consistently score low,
 diagnose which skill is responsible for THOSE queries specifically, rather than
 defaulting to the field you've been iterating on.
 
-### Reverting and branching
-
-You are not limited to iterating on the latest prompt. You can base your changes
-on ANY prompt from `score_history` by setting `base_prompt_id` in your output.
-
-**When to branch:** Do NOT branch after a single bad iteration. Stay on the
-current branch and try to recover unless the last 3 or more consecutive
-iterations have ALL scored 5+ points below the best score ever seen. A single
-score drop is often temporary — keep iterating forward. Only abandon a branch
-when there is sustained evidence that the direction is not working.
-
-When you decide to branch:
-- Set `base_prompt_id` to the `prompt_id` of the prompt you want to branch from
-  (visible in `score_history`).
-- If `best_prompt_json` is provided (non-null), you can use it directly as your
-  starting point — modify it and return the result as `prompt_json`.
-- Your `change_description` should note the revert, e.g., "Reverted to prompt 3
-  and tried a different approach to skill_market."
-
 ## Rules
 
 1. Usually modify 1-2 fields per iteration. Use `changed_fields` to declare which.
@@ -164,12 +140,30 @@ Return ONLY a JSON object (no markdown, no explanation):
         "skill_discovery": "..."
     },
     "changed_fields": ["skill_market"],
-    "change_description": "<1-2 sentences: what you changed and why>",
-    "base_prompt_id": null
+    "change_description": "<1-2 sentences: what you changed and why>"
 }
+"""
 
-`base_prompt_id`: set to null (or omit) to iterate on the current prompt as usual.
-Set to an earlier prompt_id from score_history to branch from that prompt instead.
+LEARNER_BRANCH_ADDENDUM = """
+## Branching
+
+You are not limited to iterating on the latest prompt. You can base your changes
+on ANY prompt from `score_history` by setting `base_prompt_id` in your output.
+
+Additional input fields available when branching is enabled:
+- `best_prompt_json`: the artifact JSON for the highest-scoring prompt
+- `best_prompt_id`: the prompt id of the best-scoring prompt
+- `best_prompt_avg_score`: average score of the best-scoring prompt
+
+When you decide to branch:
+- Set `base_prompt_id` to the `prompt_id` of the prompt you want to branch from
+  (visible in `score_history`).
+- If `best_prompt_json` is provided, you can use it directly as your starting
+  point — modify it and return the result as `prompt_json`.
+- Your `change_description` should note the revert, e.g., "Reverted to prompt 3
+  and tried a different approach to skill_market."
+
+If `base_prompt_id` is absent or null, your changes apply to the current prompt.
 """
 
 MAX_RETRIES = 3
@@ -266,6 +260,7 @@ def _call_learner_llm(
     best_prompt_json: dict | None = None,
     best_prompt_id: int | None = None,
     best_prompt_avg_score: float | None = None,
+    branching_enabled: bool = False,
 ) -> dict:
     """Ask the learner LLM to generate an improved prompt artifact."""
     from google import genai
@@ -280,7 +275,7 @@ def _call_learner_llm(
     else:
         highest_impact = "addressability"
 
-    learner_input = json.dumps({
+    input_payload: dict = {
         "current_prompt_json": current_prompt_json,
         "score_history": score_history,
         "sub_scores": sub_scores,
@@ -290,18 +285,25 @@ def _call_learner_llm(
         "per_query_reasoning": per_query_reasoning,
         "per_query_scores": per_query_scores or [],
         "per_query_call_traces": per_query_call_traces,
-        "best_prompt_json": best_prompt_json,
-        "best_prompt_id": best_prompt_id,
-        "best_prompt_avg_score": best_prompt_avg_score,
-    })
+    }
+    if branching_enabled:
+        input_payload["best_prompt_json"] = best_prompt_json
+        input_payload["best_prompt_id"] = best_prompt_id
+        input_payload["best_prompt_avg_score"] = best_prompt_avg_score
+    learner_input = json.dumps(input_payload)
+
+    instruction = LEARNER_INSTRUCTION
+    if branching_enabled:
+        instruction += LEARNER_BRANCH_ADDENDUM
 
     LEARNER_MODEL = "gemini-2.5-flash"
     best_info = f", best_prompt={best_prompt_id} avg={best_prompt_avg_score:.1f}" if best_prompt_id else ""
+    branch_str = ", branching=enabled" if branching_enabled else ""
     log.info(
         f"Learner LLM call starting (model={LEARNER_MODEL}, highest_impact={highest_impact}, "
         f"plateau={plateau_detected}, history={len(score_history)} entries, "
         f"artifact {len(json.dumps(current_prompt_json)):,} chars, "
-        f"traces={len(per_query_call_traces)}{best_info})"
+        f"traces={len(per_query_call_traces)}{best_info}{branch_str})"
     )
 
     t_client = time.monotonic()
@@ -314,7 +316,7 @@ def _call_learner_llm(
             model=LEARNER_MODEL,
             contents=learner_input,
             config=types.GenerateContentConfig(
-                system_instruction=LEARNER_INSTRUCTION,
+                system_instruction=instruction,
                 response_mime_type="application/json",
                 temperature=0.4,
             ),
@@ -362,6 +364,25 @@ def _call_learner_llm(
                 log.error(f"Learner LLM call failed: {e}")
                 raise
     raise RuntimeError(f"Learner LLM failed after {MAX_RETRIES} retries: {last_error}")
+
+
+def _should_allow_branch(
+    score_history: list[dict],
+    best_avg_score: float | None,
+    consecutive_required: int = 3,
+    drop_threshold: float = 5.0,
+) -> bool:
+    """Return True only when the last `consecutive_required` iterations all
+    scored at least `drop_threshold` points below the best-ever average.
+    Used to decide whether to reveal branching instructions to the learner LLM
+    — when False, the LLM doesn't even know branching is an option."""
+    if not best_avg_score or len(score_history) < consecutive_required:
+        return False
+    tail = score_history[-consecutive_required:]
+    return all(
+        (h.get("avg_score") or 0) < best_avg_score - drop_threshold
+        for h in tail
+    )
 
 
 def _detect_plateau(score_history: list[dict], window: int = 3) -> bool:
@@ -608,20 +629,30 @@ def run_learner(
                 for r in results
             ]
 
-            # Load best-ever prompt for branching context
+            # Branching: only reveal the option to the LLM when
+            # the last 3+ consecutive iterations all scored 5+ pts
+            # below the best-ever.  Otherwise the LLM doesn't even
+            # know branching exists, saving tokens and preventing
+            # premature reverts.
             best_prompt_json: dict | None = None
             best_prompt_id: int | None = None
             best_prompt_avg_score: float | None = None
             best_prompt_rec = db.get_best_prompt()
             if best_prompt_rec and best_prompt_rec.id != prompt_rec.id:
+                best_prompt_avg_score = db.get_avg_score_for_prompt(best_prompt_rec.id)
+
+            branching_enabled = _should_allow_branch(
+                score_history, best_prompt_avg_score,
+                consecutive_required=3, drop_threshold=5.0,
+            )
+            if branching_enabled and best_prompt_rec and best_prompt_rec.id != prompt_rec.id:
                 try:
                     best_artifact = json.loads(best_prompt_rec.prompt_text)
                     if validate_artifact(best_artifact):
                         best_prompt_json = best_artifact
                         best_prompt_id = best_prompt_rec.id
-                        best_prompt_avg_score = db.get_avg_score_for_prompt(best_prompt_rec.id)
                         log.info(
-                            f"Best prompt available for branching: id={best_prompt_id} "
+                            f"Branching enabled: best prompt id={best_prompt_id} "
                             f"avg={best_prompt_avg_score:.1f}"
                         )
                 except (json.JSONDecodeError, TypeError):
@@ -641,6 +672,7 @@ def run_learner(
                     best_prompt_json=best_prompt_json,
                     best_prompt_id=best_prompt_id,
                     best_prompt_avg_score=best_prompt_avg_score,
+                    branching_enabled=branching_enabled,
                 )
                 learner_llm_s = time.monotonic() - t_learner
                 new_artifact = learner_result.get("prompt_json", {})
