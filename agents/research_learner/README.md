@@ -85,7 +85,7 @@ python -m research_learner.run --report
 
 # Export the best-scoring prompt to the researcher agent
 python -m research_learner.run --export-best
-# -> writes agents/researcher/planner_prompt.txt
+# -> writes agents/researcher/planner_prompt.json
 ```
 
 ## How it works
@@ -171,6 +171,6 @@ into an existing DB.
 ## Publishing the best prompt
 
 `--export-best` writes the highest-scoring prompt to
-`agents/researcher/planner_prompt.txt`. The production researcher agent loads
-this file at runtime (falling back to its hardcoded instruction if the file
+`agents/researcher/planner_prompt.json`. The production researcher agent loads
+this file at runtime (falling back to `DEFAULT_OPTIMIZABLE_PROMPT` if the file
 doesn't exist).
